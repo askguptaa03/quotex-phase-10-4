@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>SignalPro — AI Performance Reports</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<!--
+  Phase 10.4 Goal 4 — minimal additive page. Self-contained: its own
+  inline script below, no dependency on static/app.js (untouched).
+  Reuses style.css's existing body/typography/badge rules; the handful
+  of layout rules below are page-scoped only, not a new CSS framework.
+-->
+<style>
+  .reports-page { max-width: 960px; margin: 0 auto; padding: 24px 16px 80px; }
+  .reports-page h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .reports-page .sub { opacity: 0.7; margin-bottom: 20px; font-size: 0.85rem; }
+  .reports-nav { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  .reports-nav button {
+    padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.04); color: inherit; cursor: pointer; font-size: 0.8rem;
+  }
+  .reports-nav button.active { background: rgba(255,255,255,0.16); }
+  .report-section {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 16px;
+    margin-bottom: 16px; background: rgba(255,255,255,0.02);
+  }
+  .report-section h2 { font-size: 1rem; margin: 0 0 10px; }
+  .report-section pre {
+    white-space: pre-wrap; word-break: break-word; font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem; line-height: 1.4; opacity: 0.9; max-height: 420px; overflow: auto;
+  }
+  .reports-status { font-size: 0.8rem; opacity: 0.7; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+  <div class="reports-page">
+    <h1>AI Performance Reports</h1>
+    <div class="sub">Phase 10.4 Goal 4 — read-only, generated from already-verified data.</div>
+
+    <nav class="reports-nav" id="reports-nav">
+      <button data-report="daily">Daily</button>
+      <button data-report="weekly">Weekly</button>
+      <button data-report="monthly">Monthly</button>
+      <button data-report="assets">Assets</button>
+      <button data-report="timeframes">Timeframes</button>
+      <button data-report="indicators">Indicators</button>
+      <button data-report="validation">Validation</button>
+      <button data-report="learning">Learning</button>
+      <button data-report="ai-health">AI Health</button>
+      <button data-report="calibration">Calibration</button>
+      <button data-report="export">Export (all)</button>
+    </nav>
+
+    <div class="reports-status" id="reports-status">Select a report above.</div>
+    <div class="report-section" id="reports-output" hidden>
+      <h2 id="reports-output-title"></h2>
+      <pre id="reports-output-body"></pre>
+    </div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+  var buttons = document.querySelectorAll("#reports-nav button");
+  var statusEl = document.getElementById("reports-status");
+  var outputEl = document.getElementById("reports-output");
+  var titleEl = document.getElementById("reports-output-title");
+  var bodyEl = document.getElementById("reports-output-body");
+
+  function loadReport(name) {
+    buttons.forEach(function (b) { b.classList.toggle("active", b.dataset.report === name); });
+    statusEl.textContent = "Loading /api/reports/" + name + " …";
+    outputEl.hidden = true;
+    fetch("/api/reports/" + name)
+      .then(function (res) {
+        if (!res.ok) { throw new Error("HTTP " + res.status); }
+        return res.json();
+      })
+      .then(function (data) {
+        statusEl.textContent = "GET /api/reports/" + name + " — OK";
+        titleEl.textContent = name.charAt(0).toUpperCase() + name.slice(1) + " Report";
+        bodyEl.textContent = JSON.stringify(data, null, 2);
+        outputEl.hidden = false;
+      })
+      .catch(function (err) {
+        statusEl.textContent = "Failed to load /api/reports/" + name + ": " + err.message;
+      });
+  }
+
+  buttons.forEach(function (btn) {
+    btn.addEventListener("click", function () { loadReport(btn.dataset.report); });
+  });
+})();
+</script>
+</body>
+</html>

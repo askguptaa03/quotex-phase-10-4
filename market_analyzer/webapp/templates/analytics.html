@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>SignalPro — Advanced Analytics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<!-- Same Chart.js build templates/index.html already loads — not a new dependency. -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<!--
+  Phase 10.4 Goal 5 — minimal additive page. Self-contained: its own
+  inline script below, no dependency on static/app.js (untouched).
+  Reuses style.css's existing body/typography/badge rules; the layout
+  rules below are page-scoped only, not a new CSS framework.
+-->
+<style>
+  .analytics-page { max-width: 1080px; margin: 0 auto; padding: 24px 16px 80px; }
+  .analytics-page h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .analytics-page .sub { opacity: 0.7; margin-bottom: 4px; font-size: 0.85rem; }
+  .analytics-shortcuts { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; }
+  .analytics-shortcuts a {
+    padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.04); color: inherit; text-decoration: none; font-size: 0.8rem;
+  }
+  .analytics-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 720px) { .analytics-grid { grid-template-columns: 1fr 1fr; } }
+  .a-card {
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 16px;
+    background: rgba(255,255,255,0.02);
+  }
+  .a-card h2 { font-size: 0.95rem; margin: 0 0 10px; }
+  .a-card canvas { max-height: 220px; }
+  .a-list { list-style: none; margin: 0; padding: 0; font-size: 0.82rem; }
+  .a-list li { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,0.08); }
+  .a-empty { opacity: 0.6; font-size: 0.8rem; }
+  .a-status { font-size: 0.8rem; opacity: 0.7; margin-bottom: 14px; }
+  .a-full-width { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+  <div class="analytics-page">
+    <h1>Advanced Analytics Dashboard</h1>
+    <div class="sub">Phase 10.4 Goal 5 — read-only, built from Goals 1-4's already-verified data.</div>
+
+    <div class="analytics-shortcuts">
+      <a href="/">◈ Main Dashboard</a>
+      <a href="/reports">Report Shortcuts</a>
+      <a href="/api/reports/export" target="_blank" rel="noopener">Export (JSON)</a>
+      <a href="/api/analytics/dashboard" target="_blank" rel="noopener">Raw Dashboard JSON</a>
+    </div>
+
+    <div class="a-status" id="a-status">Loading /api/analytics/dashboard …</div>
+
+    <div class="analytics-grid" id="a-grid" hidden>
+      <div class="a-card a-full-width">
+        <h2>Historical Accuracy / Confidence (AI Health Trend)</h2>
+        <canvas id="chart-trend"></canvas>
+      </div>
+
+      <div class="a-card">
+        <h2>Walk-Forward Summary</h2>
+        <ul class="a-list" id="wf-summary"></ul>
+      </div>
+
+      <div class="a-card">
+        <h2>Calibration Summary</h2>
+        <ul class="a-list" id="cal-summary"></ul>
+      </div>
+
+      <div class="a-card">
+        <h2>Best / Worst Indicators</h2>
+        <ul class="a-list" id="indicator-list"></ul>
+      </div>
+
+      <div class="a-card">
+        <h2>Best / Worst Assets</h2>
+        <ul class="a-list" id="asset-list"></ul>
+      </div>
+
+      <div class="a-card">
+        <h2>Best / Worst Timeframes</h2>
+        <ul class="a-list" id="timeframe-list"></ul>
+      </div>
+
+      <div class="a-card">
+        <h2>Regime Distribution</h2>
+        <canvas id="chart-regime"></canvas>
+      </div>
+
+      <div class="a-card">
+        <h2>Validation Distribution (wins vs losses)</h2>
+        <canvas id="chart-validation"></canvas>
+      </div>
+
+      <div class="a-card">
+        <h2>Learning Distribution</h2>
+        <canvas id="chart-learning"></canvas>
+      </div>
+
+      <div class="a-card a-full-width">
+        <h2>Warnings</h2>
+        <ul class="a-list" id="warnings-list"></ul>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+  var statusEl = document.getElementById("a-status");
+  var gridEl = document.getElementById("a-grid");
+
+  function fillList(elId, entries, emptyText) {
+    var el = document.getElementById(elId);
+    el.innerHTML = "";
+    if (!entries || !entries.length) {
+      var li = document.createElement("li");
+      li.className = "a-empty";
+      li.textContent = emptyText;
+      el.appendChild(li);
+      return;
+    }
+    entries.forEach(function (entry) {
+      var li = document.createElement("li");
+      li.innerHTML = "<span>" + entry[0] + "</span><span>" + entry[1] + "</span>";
+      el.appendChild(li);
+    });
+  }
+
+  function makeLineChart(canvasId, labels, series) {
+    var ctx = document.getElementById(canvasId);
+    if (!ctx || typeof Chart === "undefined") { return; }
+    new Chart(ctx, {
+      type: "line",
+      data: { labels: labels, datasets: series },
+      options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } },
+    });
+  }
+
+  function makeDoughnut(canvasId, labels, values) {
+    var ctx = document.getElementById(canvasId);
+    if (!ctx || typeof Chart === "undefined" || !labels.length) { return; }
+    new Chart(ctx, { type: "doughnut", data: { labels: labels, datasets: [{ data: values }] },
+      options: { responsive: true, maintainAspectRatio: false } });
+  }
+
+  function makeBar(canvasId, labels, values, label) {
+    var ctx = document.getElementById(canvasId);
+    if (!ctx || typeof Chart === "undefined" || !labels.length) { return; }
+    new Chart(ctx, { type: "bar", data: { labels: labels, datasets: [{ label: label, data: values }] },
+      options: { responsive: true, maintainAspectRatio: false } });
+  }
+
+  fetch("/api/analytics/dashboard")
+    .then(function (res) {
+      if (!res.ok) { throw new Error("HTTP " + res.status); }
+      return res.json();
+    })
+    .then(function (data) {
+      statusEl.textContent = "Loaded — generated at " + data.generated_at;
+      gridEl.hidden = false;
+
+      // Historical Accuracy / Confidence trend (daily report's period_metrics).
+      var periods = (data.daily && data.daily.period_metrics) ? data.daily.period_metrics : {};
+      var labels = Object.keys(periods).sort();
+      makeLineChart("chart-trend", labels, [
+        { label: "Accuracy", data: labels.map(function (k) { return periods[k].accuracy; }), borderColor: "#4ade80" },
+        { label: "Confidence", data: labels.map(function (k) { return periods[k].confidence; }), borderColor: "#60a5fa" },
+      ]);
+
+      // Walk-Forward Summary.
+      var wf = data.walk_forward || {};
+      if (wf.available && wf.summary) {
+        fillList("wf-summary", Object.keys(wf.summary).map(function (k) { return [k, wf.summary[k]]; }), "");
+      } else {
+        fillList("wf-summary", [], "Not available (no live walk-forward run wired into this dashboard yet).");
+      }
+
+      // Calibration Summary.
+      var cal = data.calibration || {};
+      if (cal.available) {
+        fillList("cal-summary", [
+          ["Best asset", cal.best_asset || "—"],
+          ["Best timeframe", cal.best_timeframe || "—"],
+          ["Recommendations", (cal.recommendations || []).length],
+        ], "");
+      } else {
+        fillList("cal-summary", [], "Not available.");
+      }
+
+      // Best / Worst Indicators / Assets / Timeframes.
+      var ind = data.indicators || {};
+      fillList("indicator-list", [
+        ["Best", ind.best_indicator || "—"], ["Worst", ind.worst_indicator || "—"],
+      ], "No indicator data yet.");
+
+      var assets = data.assets || {};
+      fillList("asset-list", [
+        ["Best", assets.best_asset || "—"], ["Worst", assets.worst_asset || "—"],
+      ], "No asset data yet.");
+
+      var timeframes = data.timeframes || {};
+      fillList("timeframe-list", [
+        ["Best", timeframes.best_timeframe || "—"], ["Worst", timeframes.worst_timeframe || "—"],
+      ], "No timeframe data yet.");
+
+      // Regime Distribution.
+      var regime = data.regime_distribution || {};
+      makeDoughnut("chart-regime", Object.keys(regime), Object.values(regime));
+
+      // Validation Distribution.
+      var vdist = (data.validation_distribution && data.validation_distribution.indicators) || {};
+      var vLabels = Object.keys(vdist);
+      makeBar("chart-validation", vLabels, vLabels.map(function (k) { return vdist[k].total_wins; }), "Wins");
+
+      // Learning Distribution.
+      var learning = data.learning || {};
+      makeBar("chart-learning",
+        ["improving", "degrading", "stable", "no_data"],
+        [(learning.improving || []).length, (learning.degrading || []).length,
+         (learning.stable || []).length, (learning.no_data || []).length],
+        "Indicator count");
+
+      // Warnings.
+      fillList("warnings-list", (data.warnings || []).map(function (w) { return [w.severity, w.message]; }),
+        "No warnings.");
+    })
+    .catch(function (err) {
+      statusEl.textContent = "Failed to load /api/analytics/dashboard: " + err.message;
+    });
+})();
+</script>
+</body>
+</html>

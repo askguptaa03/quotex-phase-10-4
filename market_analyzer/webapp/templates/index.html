@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>SignalPro — OTC Market Signal Generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <div class="app-shell">
+
+    <!-- ══════════════════ TOP HEADER ══════════════════ -->
+    <header class="topbar">
+      <button class="icon-btn" id="menu-btn" type="button" aria-label="Open menu">
+        <span class="ico-burger"><span></span><span></span><span></span></span>
+      </button>
+
+      <div class="brand">
+        <span class="brand-logo">◈</span>
+        <span class="brand-name">Signal<span class="brand-accent">Pro</span></span>
+      </div>
+
+      <div class="topbar-right">
+        <span class="live-pill"><span class="live-dot"></span>LIVE</span>
+        <button class="icon-btn" id="notif-btn" type="button" aria-label="Notifications">
+          🔔<span class="notif-dot" id="notif-dot" hidden></span>
+        </button>
+        <span class="conn-indicator" id="conn-indicator" title="Connection status">
+          <span class="conn-dot"></span>
+        </span>
+      </div>
+    </header>
+
+    <!-- Drawer menu -->
+    <div class="drawer-overlay" id="drawer-overlay" hidden></div>
+    <aside class="drawer" id="drawer" hidden aria-hidden="true">
+      <div class="drawer-head">
+        <div class="brand">
+          <span class="brand-logo">◈</span>
+          <span class="brand-name">Signal<span class="brand-accent">Pro</span></span>
+        </div>
+        <button class="icon-btn" id="drawer-close" type="button" aria-label="Close menu">✕</button>
+      </div>
+      <div class="drawer-mode">
+        <span class="badge {{ 'badge-demo' if is_demo else 'badge-live' }}">{{ 'DEMO ACCOUNT' if is_demo else 'LIVE ACCOUNT' }}</span>
+        <span class="badge badge-readonly">READ-ONLY</span>
+      </div>
+      <nav class="drawer-nav">
+        <button class="drawer-link" data-nav="scanner"><span>📡</span>Auto Scanner</button>
+        <button class="drawer-link" data-nav="smart-scanner"><span>📶</span>Smart Scanner</button>
+        <button class="drawer-link" data-nav="validation"><span>🧪</span>Validation</button>
+        <button class="drawer-link" data-nav="learning"><span>🧠</span>Learning</button>
+        <button class="drawer-link" data-nav="ai-health"><span>🩺</span>AI Health</button>
+        <button class="drawer-link" data-nav="analyzer"><span>🎯</span>Manual Analyzer</button>
+        <button class="drawer-link" data-nav="signals"><span>⚡</span>Signals &amp; Markets</button>
+        <button class="drawer-link" data-nav="history"><span>🕐</span>History</button>
+        <button class="drawer-link" data-nav="settings"><span>⚙️</span>Settings</button>
+        <button class="drawer-link" data-nav="backtest"><span>📊</span>Backtest</button>
+        <button class="drawer-link" data-nav="indicators"><span>🧩</span>Indicators</button>
+        <button class="drawer-link" data-nav="session"><span>🔑</span>Quotex Session</button>
+      </nav>
+      <p class="drawer-disclaimer">⚠ Analysis only — no order-execution code path exists anywhere in this project. Nothing here ever places a trade.</p>
+    </aside>
+
+    <!-- Notification dropdown -->
+    <div class="notif-panel" id="notif-panel" hidden>
+      <div class="notif-panel-head">Recent Signals</div>
+      <div class="notif-list" id="notif-list">
+        <div class="tab-empty small">No signals yet — run a scan to populate this feed.</div>
+      </div>
+    </div>
+
+    <main class="app-main">
+
+      <!-- ══════════════════ OVERVIEW STAT CARD ══════════════════ -->
+      <section class="glass-card overview-card">
+        <div class="overview-cell">
+          <span class="overview-label">OTC Assets</span>
+          <span class="overview-value" id="stat-assets">—</span>
+        </div>
+        <div class="overview-cell">
+          <span class="overview-label">Scanning Status</span>
+          <span class="overview-value" id="stat-status"><span class="status-dot idle"></span>Idle</span>
+        </div>
+        <div class="overview-cell">
+          <span class="overview-label">Last Updated</span>
+          <span class="overview-value mono" id="stat-updated">—</span>
+        </div>
+        <div class="overview-cell">
+          <span class="overview-label">Current Payout</span>
+          <span class="overview-value accent" id="stat-payout">—</span>
+        </div>
+      </section>
+
+      <!-- ══════════════════ SEGMENTED TABS ══════════════════ -->
+      <div class="seg-tabs" role="tablist">
+        <button class="seg-tab active" type="button" data-view="scanner" role="tab" aria-selected="true">Auto Scanner</button>
+        <button class="seg-tab" type="button" data-view="analyzer" role="tab" aria-selected="false">Manual Analyzer</button>
+      </div>
+
+      <!-- ══════════════════ AUTO SCANNER VIEW ══════════════════ -->
+      <section class="view" id="view-scanner">
+
+        <!-- Phase 7.4: explicit opt-in control — the scanner NEVER starts on
+             its own (page load, tab navigation, or reload). It only starts
+             when this button is pressed, and it stops if the page/tab is
+             closed. Reopening the site always starts with this OFF. -->
+        <div class="glass-card auto-scan-toggle-card">
+          <div class="auto-scan-toggle-row">
+            <div class="auto-scan-toggle-text">
+              <span class="auto-scan-toggle-title">Auto Scanner</span>
+              <span class="auto-scan-toggle-sub" id="auto-scan-status-sub">Off — press Enable to start scanning</span>
+            </div>
+            <button class="switch" id="auto-scan-toggle-btn" type="button" role="switch" aria-checked="false">
+              <span class="switch-knob"></span>
+            </button>
+          </div>
+        </div>
+
+        <div class="mini-stats-row">
+          <div class="mini-stat buy">
+            <span class="mini-stat-label">Top BUY</span>
+            <span class="mini-stat-value" id="mini-top-buy">—</span>
+          </div>
+          <div class="mini-stat sell">
+            <span class="mini-stat-label">Top SELL</span>
+            <span class="mini-stat-value" id="mini-top-sell">—</span>
+          </div>
+          <div class="mini-stat neutral">
+            <span class="mini-stat-label">Signals Today</span>
+            <span class="mini-stat-value" id="mini-signals-today">0</span>
+          </div>
+        </div>
+
+        <!-- Large signal hero card (template — cloned by JS for scanner + analyzer) -->
+        <template id="signal-card-template">
+          <div class="glass-card signal-hero">
+            <div class="hero-top">
+              <div class="hero-asset-wrap">
+                <span class="hero-asset" data-f="asset">—</span>
+                <span class="hero-tf" data-f="tf-badge">—</span>
+              </div>
+              <span class="hero-direction" data-f="direction">WAIT</span>
+            </div>
+            <p class="hero-subtitle" data-f="subtitle">—</p>
+
+            <div class="hero-score-row">
+              <div class="gauge-wrap">
+                <svg viewBox="0 0 120 120" class="gauge-svg">
+                  <circle cx="60" cy="60" r="52" class="gauge-track"></circle>
+                  <circle cx="60" cy="60" r="52" class="gauge-fill" data-f="gauge-circle"
+                          stroke-dasharray="326.7" stroke-dashoffset="326.7"></circle>
+                </svg>
+                <div class="gauge-center">
+                  <span class="gauge-value" data-f="gauge-value">0</span>
+                  <span class="gauge-suffix">%</span>
+                  <span class="gauge-caption">STRENGTH</span>
+                </div>
+              </div>
+
+              <div class="hero-facts">
+                <div class="hero-fact">
+                  <span class="hero-fact-k">Filter Score</span>
+                  <span class="hero-fact-v"><span data-f="score">0</span>/100</span>
+                </div>
+                <div class="hero-fact">
+                  <span class="hero-fact-k">Trend</span>
+                  <span class="hero-fact-v" data-f="trend">—</span>
+                </div>
+                <div class="hero-fact">
+                  <span class="hero-fact-k">Timeframe</span>
+                  <span class="hero-fact-v" data-f="timeframes">—</span>
+                </div>
+                <div class="hero-fact">
+                  <span class="hero-fact-k">Expiry</span>
+                  <span class="hero-fact-v" data-f="expiry">—</span>
+                </div>
+                <div class="hero-fact">
+                  <span class="hero-fact-k">Updated</span>
+                  <span class="hero-fact-v" data-f="updated">—</span>
+                </div>
+                <div class="hero-fact">
+                  <span class="hero-fact-k">Payout</span>
+                  <span class="hero-fact-v" data-f="payout">—</span>
+                </div>
+              </div>
+            </div>
+
+            <h4 class="hero-section-title">Passed Filters</h4>
+            <div class="filters-grid" data-f="filters"></div>
+
+            <div class="small-metrics-grid" data-f="metrics"></div>
+
+            <div class="hero-chart-wrap" data-f="chart-wrap">
+              <canvas class="hero-chart"></canvas>
+            </div>
+          </div>
+        </template>
+
+        <div id="hero-slot">
+          <div class="glass-card signal-hero placeholder" id="hero-placeholder">
+            <span class="placeholder-icon">📡</span>
+            <p>Scanning OTC markets…</p>
+            <p class="placeholder-sub" id="scan-progress-text">Preparing scan cycle</p>
+          </div>
+        </div>
+
+        <div class="section-head">
+          <h3 class="section-title">Top Signals</h3>
+          <button class="tab-refresh-btn" id="rescan-btn" type="button">↻ Rescan</button>
+        </div>
+        <div class="signals-list" id="signals-list">
+          <div class="tab-loading">Waiting for first scan…</div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ MANUAL ANALYZER VIEW ══════════════════ -->
+      <section class="view" id="view-analyzer" hidden>
+
+        <!-- ── Loading skeleton (shown immediately on Analyze click) ── -->
+        <div id="man-loading-slot" class="glass-card man-loading-card" hidden>
+          <div class="man-load-wrap">
+            <div class="man-load-spinner"></div>
+            <p class="man-load-label">Analyzing <strong id="man-load-asset">—</strong></p>
+            <p class="man-load-sub">Running full live pipeline…</p>
+          </div>
+        </div>
+
+        <!-- ── Result card (above the form on mobile) ── -->
+        <div id="man-result-slot"></div>
+
+        <!-- ── Placeholder (shown until first Analyze) ── -->
+        <section class="glass-card result placeholder" id="man-placeholder">
+          <span class="placeholder-icon">🎯</span>
+          <p>Select a pair, timeframe and expiry, then press Analyze.</p>
+          <p class="placeholder-sub">Every analysis re-runs the full live pipeline: candle fetch → indicators → backtest → weighted confluence vote.</p>
+        </section>
+
+        <!-- ── Configuration form (below result on mobile) ── -->
+        <section class="glass-card controls">
+          <h2 class="panel-title">Configure Analysis</h2>
+
+          <!-- Selected-asset badge — always shows which pair is queued -->
+          <div class="man-selected-info" id="man-selected-info">
+            <span class="man-sel-label">Selected:</span>
+            <span class="man-sel-asset" id="man-selected-display">—</span>
+          </div>
+
+          <label class="field-label">Pair</label>
+          <!-- Live Asset Availability banner — never presents the static
+               known universe as currently available; populated by
+               renderLiveOtcBanner() in app.js from GET /api/assets/live. -->
+          <p class="page-intro small" id="man-live-otc-banner" style="margin-top:0;">Checking live Quotex asset availability…</p>
+          <input type="hidden" id="man-asset" value="{{ default_asset }}">
+          <input type="text" id="man-asset-search" class="field-input"
+                 placeholder="Search pairs…" autocomplete="off" spellcheck="false">
+          <div id="man-asset-grid" class="asset-grid" role="listbox" aria-label="Asset selector"></div>
+
+          <label class="field-label" for="man-timeframe">Timeframe</label>
+          <select id="man-timeframe" class="field-select">
+            {% for tf in timeframes %}
+            <option value="{{ tf }}" {{ 'selected' if tf == default_timeframe else '' }}>{{ tf }}</option>
+            {% endfor %}
+          </select>
+
+          <label class="field-label" for="man-expiry">Expiry</label>
+          <select id="man-expiry" class="field-select">
+            <option value="30 Seconds">30 Seconds</option>
+            <option value="1 Minute" selected>1 Minute</option>
+            <option value="2 Minutes">2 Minutes</option>
+            <option value="3 Minutes">3 Minutes</option>
+            <option value="5 Minutes">5 Minutes</option>
+            <option value="15 Minutes">15 Minutes</option>
+          </select>
+
+          <button id="man-analyze-btn" class="generate-btn">
+            <span class="btn-label">Analyze</span>
+            <span class="btn-spinner" hidden></span>
+          </button>
+
+          <p id="man-error-box" class="error-box" hidden></p>
+
+          <div class="disclaimer">
+            <p>⚠ This dashboard only displays a computed signal. It never places
+            trades — there is no order-execution code path anywhere in this project.</p>
+          </div>
+        </section>
+
+      </section>
+
+      <!-- ══════════════════ SIGNALS & MARKETS PAGE ══════════════════ -->
+      <section class="view tab-page" id="page-signals" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Live Markets</h3>
+          <button class="tab-refresh-btn" id="refresh-markets-btn" type="button">↻ Refresh</button>
+        </div>
+        <div id="markets-list" class="markets-list">
+          <div class="tab-loading">Fetching prices…</div>
+        </div>
+        <p class="markets-note">Prices refresh every 15s · Tap a row to analyze that pair</p>
+
+        <div class="section-head" style="margin-top:22px;">
+          <h3 class="section-title">All Scanned Signals</h3>
+        </div>
+        <div class="signals-list" id="signals-list-full">
+          <div class="tab-empty">Run the Auto Scanner to populate this list.</div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ HISTORY PAGE ══════════════════ -->
+      <section class="view tab-page" id="page-history" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Signal History</h3>
+          <button class="tab-refresh-btn" id="clear-history-btn" type="button">🗑 Clear</button>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="tab-empty">No signals generated yet this session.</div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ SETTINGS PAGE ══════════════════ -->
+      <section class="view tab-page" id="page-settings" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Settings</h3>
+        </div>
+
+        <!-- Quick links — Settings, Backtest, Indicators and Quotex Session
+             are separate pages (also reachable from the drawer menu); these
+             give one-tap access from the bottom nav's Settings tab too. -->
+        <div class="quick-links-row">
+          <button class="quick-link-btn" type="button" data-nav="backtest">📊<span>Backtest</span></button>
+          <button class="quick-link-btn" type="button" data-nav="indicators">🧩<span>Indicators</span></button>
+          <button class="quick-link-btn" type="button" data-nav="session">🔑<span>Quotex Session</span></button>
+          <button class="quick-link-btn" type="button" data-nav="smart-scanner">📶<span>Smart Scanner</span></button>
+          <button class="quick-link-btn" type="button" data-nav="validation">🧪<span>Validation</span></button>
+        </div>
+
+        <div class="settings-cards">
+          <div class="settings-card">
+            <div class="settings-card-label">Account Mode</div>
+            <div class="settings-card-value">{{ 'Demo Account' if is_demo else 'Live Account' }}</div>
+          </div>
+          <div class="settings-card">
+            <div class="settings-card-label">Analysis Mode</div>
+            <div class="settings-card-value">Read-only · No trades are placed</div>
+          </div>
+          <div class="settings-card">
+            <div class="settings-card-label">Available Timeframes</div>
+            <div class="settings-card-value">{{ timeframes | join(' · ') }}</div>
+          </div>
+          <div class="settings-card warning">
+            <div class="settings-card-label">⚠ Disclaimer</div>
+            <div class="settings-card-value">
+              This dashboard displays computed analysis signals only.
+              No order-execution code exists anywhere in this project.
+            </div>
+          </div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Editable Settings</h3>
+          <span class="settings-save-state" id="settings-save-state"></span>
+        </div>
+        <div id="settings-form-slot" class="glass-card settings-form-card">
+          <div class="tab-loading">Loading settings…</div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Backups</h3>
+          <button class="tab-refresh-btn" id="settings-backup-now-btn" type="button">＋ Backup Now</button>
+        </div>
+        <div id="settings-backups-list" class="settings-backups-list">
+          <div class="tab-empty small">No backups yet.</div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Advanced</h3>
+        </div>
+        <div class="glass-card advanced-actions-card">
+          <button class="secondary-btn" id="settings-export-btn" type="button">⬇ Export Settings</button>
+          <label class="secondary-btn" for="settings-import-file">⬆ Import Settings
+            <input type="file" id="settings-import-file" accept="application/json" hidden>
+          </label>
+          <button class="secondary-btn danger" id="settings-reset-btn" type="button">↺ Reset to Defaults</button>
+        </div>
+        <p id="settings-error-box" class="error-box" hidden></p>
+      </section>
+
+      <!-- ══════════════════ BACKTEST PAGE ══════════════════ -->
+      <section class="view tab-page" id="page-backtest" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Backtest</h3>
+        </div>
+        <p class="page-intro">
+          Runs <code>backtest_factor_accuracy()</code> / <code>compute_dynamic_weights()</code>
+          against real historical candles for each selected asset — analysis
+          only, no trades. Multi-timeframe confirmation and Payout can never
+          be backtested (Quotex has no historical payout API); see the
+          results panel for what's included.
+        </p>
+
+        <div class="glass-card backtest-config-card">
+          <label class="field-label" for="bt-timeframe">Timeframe</label>
+          <select id="bt-timeframe" class="field-select">
+            {% for tf in timeframes %}
+            <option value="{{ tf }}" {{ 'selected' if tf == default_timeframe else '' }}>{{ tf }}</option>
+            {% endfor %}
+          </select>
+
+          <label class="field-label" for="bt-candles">Candle Count</label>
+          <select id="bt-candles" class="field-select">
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+            <option value="1500">1500</option>
+            <option value="2000" selected>2000 (default)</option>
+            <option value="3000">3000</option>
+            <option value="5000">5000</option>
+          </select>
+
+          <label class="field-label">Assets</label>
+          <div class="bt-asset-mode-row">
+            <button class="chip-toggle active" id="bt-mode-all" type="button">All OTC</button>
+            <button class="chip-toggle" id="bt-mode-custom" type="button">Choose…</button>
+          </div>
+          <div id="bt-asset-grid" class="asset-grid" hidden></div>
+
+          <div class="bt-controls-row">
+            <button class="generate-btn" id="bt-run-btn" type="button"><span class="btn-label">▶ Run Backtest</span></button>
+            <button class="secondary-btn" id="bt-pause-btn" type="button" hidden>⏸ Pause</button>
+            <button class="secondary-btn" id="bt-resume-btn" type="button" hidden>▶ Resume</button>
+            <button class="secondary-btn danger" id="bt-stop-btn" type="button" hidden>⏹ Stop</button>
+          </div>
+          <p id="bt-error-box" class="error-box" hidden></p>
+        </div>
+
+        <div class="glass-card backtest-progress-card" id="bt-progress-card" hidden>
+          <div class="bt-progress-head">
+            <span id="bt-progress-state">STOPPED</span>
+            <span id="bt-progress-pct">0%</span>
+          </div>
+          <div class="bt-progress-bar-track"><div class="bt-progress-bar-fill" id="bt-progress-bar-fill"></div></div>
+          <div class="small-metrics-grid">
+            <div class="metric-card"><span class="k">Current Asset</span><span class="v" id="bt-current-asset">—</span></div>
+            <div class="metric-card"><span class="k">Current Indicator</span><span class="v" id="bt-current-indicator">—</span></div>
+            <div class="metric-card"><span class="k">Elapsed</span><span class="v" id="bt-elapsed">—</span></div>
+            <div class="metric-card"><span class="k">ETA</span><span class="v" id="bt-eta">—</span></div>
+          </div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Results</h3>
+        </div>
+        <div id="bt-results-slot" class="glass-card backtest-results-card">
+          <div class="tab-empty">Run a backtest to see suggested weights and per-asset accuracy.</div>
+        </div>
+        <p class="page-intro small">
+          ⚠ This project's development sandbox has no network access — the
+          Backtest engine has never been exercised against live Quotex data
+          here. Timing/results above are only as good as your live environment.
+        </p>
+      </section>
+
+      <!-- ══════════════════ INDICATORS PAGE ══════════════════ -->
+      <section class="view tab-page" id="page-indicators" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Indicators</h3>
+          <button class="tab-refresh-btn" id="indicators-refresh-btn" type="button">↻ Refresh</button>
+        </div>
+        <p class="page-intro">
+          Core indicators can independently produce a BUY/SELL vote; Helper
+          indicators only adjust confidence and can never generate a signal
+          alone (the confluence engine already requires ≥3 agreeing factors).
+        </p>
+        <div id="indicators-list-slot" class="indicators-list">
+          <div class="tab-loading">Loading indicator registry…</div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ QUOTEX SESSION PAGE ══════════════════ -->
+      <section class="view tab-page" id="page-session" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Quotex Session</h3>
+        </div>
+        <div class="glass-card session-status-card" id="session-status-card">
+          <div class="tab-loading">Loading session status…</div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Update SSID</h3>
+        </div>
+        <div class="glass-card session-update-card">
+          <label class="field-label" for="session-ssid-input">Paste SSID</label>
+          <input type="text" id="session-ssid-input" class="field-input" autocomplete="off" spellcheck="false"
+                 placeholder="Paste the ssid value from Quotex DevTools…">
+          <p class="page-intro small">
+            Open quotex.io → DevTools (F12) → Network tab → WS filter →
+            find the WebSocket connection → copy the <code>ssid</code> value from
+            the URL or payload. This is saved to <code>quotex/session.json</code> only
+            — never to an environment variable.
+          </p>
+          <button class="generate-btn" id="session-save-btn" type="button"><span class="btn-label">Save SSID</span></button>
+          <button class="secondary-btn" id="session-validate-btn" type="button">✓ Validate Session</button>
+          <p id="session-error-box" class="error-box" hidden></p>
+        </div>
+
+        <div class="glass-card session-validate-result" id="session-validate-result" hidden></div>
+      </section>
+
+      <!-- ══════════════════ PHASE 8.2/8.3 — SMART SCANNER (BACKEND ENGINE) PAGE ══════════════════ -->
+      <!-- Talks ONLY to the existing /api/scanner/* and /api/settings*
+           routes (ScannerEngine + SettingsStore, Phase 7/8.1/8.2/8.3).
+           This is a SEPARATE page from the "Auto Scanner" tab above —
+           that tab is an older, simpler client-side polling loop that
+           calls /api/signal directly per asset and has never talked to
+           ScannerEngine at all (see HANDOFF.md's "single most important
+           gotcha"). No new scanner engine or route was created for this
+           page at any point. -->
+      <section class="view tab-page" id="page-smart-scanner" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Smart Scanner</h3>
+        </div>
+        <p class="page-intro">
+          Drives the backend <code>ScannerEngine</code> directly via
+          <code>/api/scanner/*</code> — the same continuously-ranking
+          engine Phase 7/7.1/8.1 built and tested. It uses the shared
+          Quotex connection and the shared background loop; there is only
+          ever one scanner instance. It <b>never starts on its own</b> —
+          not on page load, not on tab navigation — only the Start button
+          below starts it, and it keeps running server-side even if you
+          navigate away, until you (or another tab) press Stop.
+        </p>
+
+        <!-- ══ Phase 8.3 — Scanner Settings (backed by SettingsStore's
+             existing "scanner" section; same fields Phase 8.1 taught
+             ScannerEngine to read at start() time) ══ -->
+        <div class="section-head" style="margin-top:4px;">
+          <h3 class="section-title">Scanner Settings</h3>
+        </div>
+        <div class="glass-card smart-scanner-settings-card">
+          <p class="page-intro small" style="margin-top:0;">
+            Loaded automatically from Settings. Changing these does
+            <b>not</b> restart a running scanner — they apply the next
+            time you press Start.
+          </p>
+
+          <label class="field-label">Enabled Assets</label>
+          <!-- Live Asset Availability banner — see man-live-otc-banner above
+               for the shared behavior/wording. "All OTC" here always means
+               all CURRENTLY AVAILABLE OTC assets, never the static universe. -->
+          <p class="page-intro small" id="ss-live-otc-banner" style="margin-top:0;">Checking live Quotex asset availability…</p>
+          <div class="bt-asset-mode-row">
+            <button class="chip-toggle active" id="ss-set-asset-mode-all" type="button">All OTC</button>
+            <button class="chip-toggle" id="ss-set-asset-mode-custom" type="button">Choose…</button>
+          </div>
+          <div id="ss-set-asset-grid" class="asset-grid" hidden></div>
+
+          <label class="field-label" style="margin-top:14px;">Enabled Timeframes</label>
+          <div class="bt-asset-mode-row">
+            <button class="chip-toggle active" id="ss-set-tf-mode-default" type="button">Default</button>
+            <button class="chip-toggle" id="ss-set-tf-mode-custom" type="button">Choose…</button>
+          </div>
+          <div id="ss-set-tf-grid" class="bt-asset-mode-row" hidden>
+            {% for tf in timeframes %}
+            <button class="chip-toggle" type="button" data-tf="{{ tf }}">{{ tf }}</button>
+            {% endfor %}
+          </div>
+
+          <label class="field-label" for="ss-set-min-filter-score" style="margin-top:14px;">
+            Minimum Filter Score — <span id="ss-set-min-filter-score-val">0</span>
+          </label>
+          <input type="range" id="ss-set-min-filter-score" min="0" max="100" step="1" value="0">
+
+          <div class="ss-set-fields-row">
+            <div>
+              <label class="field-label" for="ss-set-top-signals">Top Signals</label>
+              <select id="ss-set-top-signals" class="field-select">
+                <option value="">Default</option>
+                <option value="5">5</option>
+                <option value="10">10</option>
+                <option value="15">15</option>
+                <option value="20">20</option>
+                <option value="25">25</option>
+                <option value="30">30</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="ss-set-scan-interval">Scan Interval</label>
+              <select id="ss-set-scan-interval" class="field-select">
+                <option value="">Default</option>
+                <option value="30">30s</option>
+                <option value="60">60s</option>
+                <option value="120">120s</option>
+                <option value="180">180s</option>
+                <option value="300">300s</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="auto-scan-toggle-row" style="margin-top:14px;">
+            <div class="auto-scan-toggle-text">
+              <span class="auto-scan-toggle-title">Scanner Enabled</span>
+              <span class="auto-scan-toggle-sub">Off = blocks the next Start (does not stop an active run)</span>
+            </div>
+            <button class="switch" id="ss-set-enabled-toggle" type="button" role="switch" aria-checked="true">
+              <span class="switch-knob"></span>
+            </button>
+          </div>
+
+          <div class="ss-controls-row" style="margin-top:16px;">
+            <button class="generate-btn" id="ss-set-save-btn" type="button"><span class="btn-label">Save Settings</span></button>
+            <button class="secondary-btn" id="ss-set-reload-btn" type="button">↻ Reload</button>
+            <button class="secondary-btn danger" id="ss-set-reset-btn" type="button">Reset to Defaults</button>
+          </div>
+          <p id="ss-set-msg" class="page-intro small" style="margin-top:8px;"></p>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Scanner Controls</h3>
+        </div>
+        <div class="glass-card smart-scanner-controls-card">
+          <div class="ss-controls-row">
+            <button class="generate-btn" id="ss-start-btn" type="button"><span class="btn-label">▶ Start Scanner</span></button>
+            <button class="secondary-btn" id="ss-pause-btn" type="button" hidden>⏸ Pause</button>
+            <button class="secondary-btn" id="ss-resume-btn" type="button" hidden>▶ Resume</button>
+            <button class="secondary-btn danger" id="ss-stop-btn" type="button" hidden>⏹ Stop</button>
+          </div>
+          <p id="ss-error-box" class="error-box" hidden></p>
+        </div>
+
+        <div class="glass-card smart-scanner-progress-card" id="ss-progress-card">
+          <div class="bt-progress-head">
+            <span id="ss-state">STOPPED</span>
+            <span id="ss-progress-pct">0%</span>
+          </div>
+          <div class="bt-progress-bar-track"><div class="bt-progress-bar-fill" id="ss-progress-bar-fill"></div></div>
+          <div class="small-metrics-grid">
+            <div class="metric-card"><span class="k">Current Asset</span><span class="v" id="ss-current-asset">—</span></div>
+            <div class="metric-card"><span class="k">Current Timeframe</span><span class="v" id="ss-current-tf">—</span></div>
+            <div class="metric-card"><span class="k">Assets Completed</span><span class="v" id="ss-assets-completed">— / —</span></div>
+            <div class="metric-card"><span class="k">Current Cycle</span><span class="v" id="ss-current-cycle">—</span></div>
+            <div class="metric-card"><span class="k">Elapsed</span><span class="v" id="ss-elapsed">—</span></div>
+            <div class="metric-card"><span class="k">ETA</span><span class="v" id="ss-eta">—</span></div>
+            <div class="metric-card"><span class="k">Last Scan</span><span class="v" id="ss-last-scan">—</span></div>
+          </div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Ranked Signals</h3>
+        </div>
+        <div id="ss-results-slot" class="glass-card ss-results-card">
+          <div class="tab-empty">Press Start Scanner to begin ranking OTC assets.</div>
+        </div>
+        <p class="page-intro small">
+          Only assets that pass every mandatory gate (<code>mandatory_pass</code>)
+          and have a non-WAIT signal are shown here — same visibility rule
+          the backend has always used. Ranked by Filter Score, then
+          Confidence, then Payout, then freshness (all descending).
+          Analysis only; nothing here places a trade.
+        </p>
+
+        <!-- M1: Full Scanner Diagnostics — read-only view of EVERY asset/
+             timeframe the scanner is configured to cover, including ones
+             hidden from Ranked Signals above (WAIT / hard-gate failures /
+             FAILED attempts / not-yet-scanned), each with the actual
+             reason. Talks only to the new, additive, read-only
+             /api/scanner/diagnostics route — no signal/gate logic here. -->
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Full Scanner Diagnostics</h3>
+        </div>
+        <div class="glass-card" id="ss-diag-card">
+          <p class="page-intro small" style="margin-top:0;">
+            Shows every asset/timeframe the scanner is configured to scan —
+            including ones hidden above — with the reason it did or didn't
+            produce a signal. Read-only; does not affect Ranked Signals.
+          </p>
+          <div class="ss-controls-row">
+            <button class="secondary-btn" id="ss-diag-toggle-btn" type="button">Show Full Diagnostics</button>
+            <button class="secondary-btn" id="ss-diag-refresh-btn" type="button" hidden>↻ Refresh</button>
+          </div>
+          <div class="small-metrics-grid" id="ss-diag-counts" hidden>
+            <div class="metric-card"><span class="k">Signal</span><span class="v" id="ss-diag-count-signal">0</span></div>
+            <div class="metric-card"><span class="k">Wait</span><span class="v" id="ss-diag-count-wait">0</span></div>
+            <div class="metric-card"><span class="k">Failed</span><span class="v" id="ss-diag-count-failed">0</span></div>
+            <div class="metric-card"><span class="k">Skipped</span><span class="v" id="ss-diag-count-skipped">0</span></div>
+          </div>
+          <div id="ss-diag-slot" hidden>
+            <div class="tab-empty">Loading…</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ PHASE 8.4.3 — VALIDATION PAGE (STEP 1: structure only) ══════════════════ -->
+      <!-- Talks to the existing /api/validation/* routes (ValidationEngine,
+           Phase 8.4.3 backend) — no new engine, no new route. This page
+           mirrors the Backtest/Smart Scanner page structure exactly.
+           Step 1 scope: layout + empty placeholders only — no fetch/poll/
+           render logic wired up yet (added in a later step). -->
+      <section class="view tab-page" id="page-validation" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Indicator Validation</h3>
+        </div>
+        <p class="page-intro">
+          Validates the 3 new, not-yet-Confluence-connected indicators
+          (Wick Rejection, Liquidity Sweep, False Breakout) against
+          historical candle data via the backend <code>ValidationEngine</code>
+          (<code>/api/validation/*</code>) — the same engine Phase 8.4.3's
+          backend built and tested. Analysis only: this never connects
+          any indicator to Confluence, never computes a dynamic weight,
+          and never places a trade. It never starts on its own — only
+          the Run Validation button below starts it.
+        </p>
+
+        <!-- Validation Settings card (Step 2: layout only — no click handlers,
+             no state tracking, no API calls wired up yet; that logic is
+             added in a later step, same as how Step 1 left the buttons
+             below inert). Reuses the exact same chip-toggle/asset-grid/
+             field-select components already established by the Backtest
+             and Smart Scanner Settings cards — no new CSS class invented. -->
+        <div class="section-head" style="margin-top:4px;">
+          <h3 class="section-title">Validation Settings</h3>
+        </div>
+        <div class="glass-card validation-settings-card" id="v-settings-card">
+          <p class="page-intro small" style="margin-top:0;">
+            Choose what to validate, then press Run Validation below.
+            Nothing here starts automatically.
+          </p>
+
+          <label class="field-label">Assets</label>
+          <!-- Live Asset Availability banner — see man-live-otc-banner above
+               for the shared behavior/wording. "All OTC" here always means
+               all CURRENTLY AVAILABLE OTC assets, never the static universe. -->
+          <p class="page-intro small" id="v-live-otc-banner" style="margin-top:0;">Checking live Quotex asset availability…</p>
+          <div class="bt-asset-mode-row">
+            <button class="chip-toggle active" id="v-set-asset-mode-all" type="button">All OTC</button>
+            <button class="chip-toggle" id="v-set-asset-mode-custom" type="button">Choose…</button>
+          </div>
+          <div id="v-set-asset-grid" class="asset-grid" hidden></div>
+
+          <label class="field-label" style="margin-top:14px;">Timeframes</label>
+          <div id="v-set-tf-grid" class="bt-asset-mode-row">
+            {% for tf in timeframes %}
+            <button class="chip-toggle{{ ' active' if tf == '5m' else '' }}" type="button" data-tf="{{ tf }}">{{ tf }}</button>
+            {% endfor %}
+          </div>
+
+          <label class="field-label" style="margin-top:14px;">Indicators</label>
+          <!-- B1 fix: populated dynamically by vBuildIndicatorGrid() in app.js from
+               window._VALIDATION_INDICATORS (all 13 supported indicators, server-
+               rendered from indicator_registry.get_registry() — not hardcoded to 3). -->
+          <div id="v-set-indicator-grid" class="bt-asset-mode-row"></div>
+
+          <div class="ss-set-fields-row">
+            <div>
+              <label class="field-label" for="v-set-candle-count">Candle Count</label>
+              <select id="v-set-candle-count" class="field-select">
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+                <option value="1500">1500</option>
+                <option value="2000" selected>2000</option>
+                <option value="3000">3000</option>
+                <option value="5000">5000</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="v-set-lookahead">Lookahead (bars)</label>
+              <select id="v-set-lookahead" class="field-select">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4" selected>4</option>
+                <option value="5">5</option>
+                <option value="10">10</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Controls card (Step 3: status badge + buttons rendered, no API
+             wiring/polling/execution logic yet — buttons remain disabled,
+             same inert approach as Step 1/2). Buttons reuse the exact
+             .generate-btn/.secondary-btn/.ss-controls-row classes already
+             established by the Backtest and Smart Scanner pages. -->
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Validation Controls</h3>
+        </div>
+        <div class="glass-card validation-controls-card">
+          <div class="v-status-badge" id="v-status-badge">
+            <span class="v-status-dot stopped" id="v-status-dot"></span>
+            <span id="v-status-text">STOPPED</span>
+          </div>
+          <div class="ss-controls-row">
+            <button class="generate-btn" id="v-run-btn" type="button"><span class="btn-label">▶ Run Validation</span></button>
+            <button class="secondary-btn" id="v-pause-btn" type="button" hidden disabled>⏸ Pause</button>
+            <button class="secondary-btn" id="v-resume-btn" type="button" hidden disabled>▶ Resume</button>
+            <button class="secondary-btn danger" id="v-stop-btn" type="button" hidden disabled>⏹ Stop</button>
+          </div>
+          <p id="v-error-box" class="error-box" hidden></p>
+        </div>
+
+        <!-- Progress card (Step 4: structure + placeholder values only — no
+             polling, no live updates, no JS wired up yet; values below are
+             static placeholders). Reuses the exact same .bt-progress-head/
+             .bt-progress-bar-track/.bt-progress-bar-fill/.small-metrics-grid/
+             .metric-card components already established by the Backtest
+             and Smart Scanner progress cards — no new CSS class. -->
+        <div class="glass-card validation-progress-card" id="v-progress-card">
+          <div class="bt-progress-head">
+            <span id="v-state">STOPPED</span>
+            <span id="v-progress-pct">0%</span>
+          </div>
+          <div class="bt-progress-bar-track"><div class="bt-progress-bar-fill" id="v-progress-bar-fill"></div></div>
+          <div class="small-metrics-grid">
+            <div class="metric-card"><span class="k">Current Asset</span><span class="v" id="v-current-asset">—</span></div>
+            <div class="metric-card"><span class="k">Current Timeframe</span><span class="v" id="v-current-timeframe">—</span></div>
+            <div class="metric-card"><span class="k">Current Indicator</span><span class="v" id="v-current-indicator">—</span></div>
+            <div class="metric-card"><span class="k">Processed Combinations</span><span class="v" id="v-combinations-processed">0</span></div>
+            <div class="metric-card"><span class="k">Total Combinations</span><span class="v" id="v-combinations-total">0</span></div>
+            <div class="metric-card"><span class="k">Elapsed</span><span class="v" id="v-elapsed">—</span></div>
+            <div class="metric-card"><span class="k">Est. Remaining</span><span class="v" id="v-eta">—</span></div>
+          </div>
+        </div>
+
+        <!-- Summary cards (Step 5: structure + placeholder values only — no
+             JS, no API calls, no live updates yet). One .glass-card per
+             indicator, each using the exact same .small-metrics-grid/
+             .metric-card components already established elsewhere on this
+             page and on the Backtest/Smart Scanner pages — no new CSS. -->
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Indicator Summary</h3>
+        </div>
+        <div id="v-summary-slot">
+          <!-- B1 fix: populated dynamically by vBuildSummaryCards() in app.js —
+               one card per indicator in window._VALIDATION_INDICATORS (13 total,
+               server-rendered from indicator_registry.get_registry()), using the
+               exact same markup/classes/id-naming convention as before
+               (v-summary-<id>, v-sum-<id>-accuracy, etc.) so no other code needs
+               to change. -->
+        </div>
+
+        <!-- Results table (Step 6: structure + placeholder rows only — no
+             JS, no API calls, no live rendering/sorting/filtering/
+             pagination yet). Reuses the exact .ss-results-table class
+             already established by the Smart Scanner page (Phase 8.2/8.3)
+             — same header/cell styling, no new CSS rule added. -->
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Validation Results</h3>
+        </div>
+        <div id="v-results-slot" class="glass-card validation-results-card">
+          <table class="ss-results-table">
+            <thead>
+              <tr>
+                <th>Asset</th>
+                <th>TF</th>
+                <th>Indicator</th>
+                <th>Accuracy</th>
+                <th>BUY Accuracy</th>
+                <th>SELL Accuracy</th>
+                <th>Reliability</th>
+                <th>Total Samples</th>
+                <th>BUY Samples</th>
+                <th>SELL Samples</th>
+                <th>Validation Status</th>
+              </tr>
+            </thead>
+            <tbody id="v-results-tbody">
+              <tr>
+                <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+                <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>Not run</td>
+              </tr>
+              <tr>
+                <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+                <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>Not run</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- History section (Step 7: structure + 3 static placeholder
+             entries only — read-only, no JS, no API calls, no persistence,
+             no filtering/searching). Reuses the exact .history-list/
+             .history-row/.history-left/.history-right/.history-asset/
+             .history-meta/.history-conf/.history-time classes already
+             established by the Signal History page (page-history) — no
+             new CSS rule added. -->
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Validation History</h3>
+        </div>
+        <div id="v-history-slot" class="glass-card validation-history-card">
+          <div class="history-list" id="v-history-list">
+            <div class="history-row">
+              <div class="history-left">
+                <span class="history-asset">Sample Asset — Wick Rejection</span>
+                <span class="history-meta">Timeframe: 5m</span>
+              </div>
+              <div class="history-right">
+                <span class="history-conf">Status: Not run</span>
+                <span class="history-conf">Accuracy: —</span>
+                <span class="history-conf">Reliability: —</span>
+                <span class="history-time">—</span>
+              </div>
+            </div>
+            <div class="history-row">
+              <div class="history-left">
+                <span class="history-asset">Sample Asset — Liquidity Sweep</span>
+                <span class="history-meta">Timeframe: 15m</span>
+              </div>
+              <div class="history-right">
+                <span class="history-conf">Status: Not run</span>
+                <span class="history-conf">Accuracy: —</span>
+                <span class="history-conf">Reliability: —</span>
+                <span class="history-time">—</span>
+              </div>
+            </div>
+            <div class="history-row">
+              <div class="history-left">
+                <span class="history-asset">Sample Asset — False Breakout</span>
+                <span class="history-meta">Timeframe: 1h</span>
+              </div>
+              <div class="history-right">
+                <span class="history-conf">Status: Not run</span>
+                <span class="history-conf">Accuracy: —</span>
+                <span class="history-conf">Reliability: —</span>
+                <span class="history-time">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Phase 9 — Smart Learning page. Advisory/recommendation only: never
+           places trades, never bypasses Hard Gates, never changes BUY/SELL
+           direction. Reuses the exact same .glass-card/.metric-card/
+           .generate-btn/.secondary-btn/.ss-controls-row/.history-row/
+           .tab-empty/.error-box components already established by the
+           Validation/Backtest/Smart Scanner pages — no new CSS class. -->
+      <section class="view tab-page" id="page-learning" hidden>
+        <div class="section-head">
+          <h3 class="section-title">Smart Learning</h3>
+        </div>
+        <p class="page-intro">
+          Reads accumulated Validation History and recommends adjusted
+          confluence weights. Advisory only: it never places trades, never
+          bypasses Hard Gates or the Filter Score, never changes BUY/SELL
+          direction, and never edits Validation History. Recommendations
+          only take effect on real signals if you press Apply below —
+          nothing here happens automatically.
+        </p>
+
+        <div class="glass-card">
+          <div class="ss-controls-row">
+            <button class="generate-btn" id="l-generate-btn" type="button"><span class="btn-label">🔄 Generate Recommendation</span></button>
+            <button class="secondary-btn" id="l-apply-btn" type="button"><span class="btn-label">✅ Apply Recommendation</span></button>
+            <button class="secondary-btn danger" id="l-reset-btn" type="button"><span class="btn-label">♻️ Reset Learning</span></button>
+          </div>
+          <p id="l-error-box" class="error-box" hidden></p>
+          <p id="l-success-box" class="page-intro small" hidden style="margin-top:10px;"></p>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Current vs. Recommended Weights</h3>
+        </div>
+        <div class="glass-card">
+          <div class="ss-results-table" id="l-status-loading">
+            <p class="page-intro small" style="margin:0;">Loading…</p>
+          </div>
+          <table class="ss-results-table" id="l-weights-table" hidden>
+            <thead>
+              <tr>
+                <th>Indicator</th>
+                <th>Current</th>
+                <th>Recommended</th>
+                <th>Trend</th>
+                <th>Confidence</th>
+                <th>Samples</th>
+              </tr>
+            </thead>
+            <tbody id="l-weights-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h3 class="section-title">Recommendation History</h3>
+        </div>
+        <div class="glass-card" id="l-history-slot">
+          <div class="tab-empty small" id="l-history-empty">No recommendations generated yet — press Generate Recommendation above.</div>
+          <div id="l-history-list"></div>
+        </div>
+
+        <!-- ═══════ Phase 10.2 — Asset Intelligence + Timeframe Intelligence ═══════
+             Additive: everything above this comment is Phase 9's unchanged Smart
+             Learning UI. Read-only — no buttons that write anywhere; these sections
+             simply render GET /api/learning/{assets,timeframes,top-indicators,
+             recommendations}. Reuses metric-card/small-metrics-grid/ss-results-table/
+             history-row/badge/tab-empty — no new CSS. -->
+        <div class="section-head" style="margin-top:28px;">
+          <h3 class="section-title">🌐 Asset &amp; Timeframe Intelligence</h3>
+        </div>
+        <p class="page-intro small">
+          Learns which indicator performs best on each OTC asset and each
+          timeframe from accumulated Validation History. Read-only — nothing
+          here is applied automatically; use the weight recommendation above
+          if you want to act on any of it.
+        </p>
+
+        <div class="section-head" style="margin-top:16px;">
+          <h4 class="section-title" style="font-size:13px;">🏆 Best Assets</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="ai-best-assets-empty">No asset validation history yet — run Validation for one or more assets first.</div>
+          <div class="small-metrics-grid" id="ai-best-assets-grid" hidden></div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">⏱️ Best Timeframes</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="ai-best-timeframes-empty">No timeframe validation history yet — run Validation for one or more timeframes first.</div>
+          <div class="small-metrics-grid" id="ai-best-timeframes-grid" hidden></div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">📊 Asset Rankings</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="ai-asset-ranking-empty">No ranked assets yet.</div>
+          <table class="ss-results-table" id="ai-asset-ranking-table" hidden>
+            <thead><tr><th>Asset</th><th>Validations</th><th>Win Rate</th><th>Trend</th><th>Confidence</th><th>Best Indicator</th></tr></thead>
+            <tbody id="ai-asset-ranking-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">📊 Timeframe Rankings</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="ai-tf-ranking-empty">No ranked timeframes yet.</div>
+          <table class="ss-results-table" id="ai-tf-ranking-table" hidden>
+            <thead><tr><th>Timeframe</th><th>Validations</th><th>Win Rate</th><th>Trend</th><th>Confidence</th><th>Best Indicator</th></tr></thead>
+            <tbody id="ai-tf-ranking-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">⭐ Top Indicators &nbsp;/&nbsp; ⚠️ Weak Indicators</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="ai-top-indicators-empty">No indicator has enough accumulated samples yet.</div>
+          <div class="small-metrics-grid" id="ai-top-indicators-grid" hidden></div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">📈 Indicator Trends</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="ai-trends-empty">No indicator has a clear trend yet.</div>
+          <div id="ai-trends-list" hidden>
+            <div class="history-row" style="border:none;padding:4px 0;"><strong style="font-size:11px;color:var(--text-muted);">📈 Improving</strong></div>
+            <div id="ai-improving-list"></div>
+            <div class="history-row" style="border:none;padding:12px 0 4px;"><strong style="font-size:11px;color:var(--text-muted);">📉 Declining</strong></div>
+            <div id="ai-declining-list"></div>
+          </div>
+        </div>
+
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">💡 Recommendation Cards</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="ai-rec-cards-empty">No recommendations yet — accumulate more Validation History first.</div>
+          <div id="ai-rec-cards" hidden>
+            <div style="margin-bottom:10px;"><strong style="font-size:11px;color:var(--text-muted);">Best indicator per asset</strong>
+              <div id="ai-rec-per-asset" class="small-metrics-grid" style="margin-top:8px;"></div>
+            </div>
+            <div><strong style="font-size:11px;color:var(--text-muted);">Best indicator per timeframe</strong>
+              <div id="ai-rec-per-timeframe" class="small-metrics-grid" style="margin-top:8px;"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view tab-page" id="page-ai-health" hidden>
+        <div class="section-head">
+          <h4 class="section-title">🩺 AI Health Dashboard</h4>
+          <button class="tab-refresh-btn" onclick="aihLoadAll()">Refresh</button>
+        </div>
+
+        <!-- Overall Health hero card -->
+        <div class="glass-card" style="text-align:center;padding:22px 16px;">
+          <div style="font-size:11px;color:var(--text-muted);letter-spacing:0.06em;text-transform:uppercase;">Overall AI Health</div>
+          <div style="margin-top:8px;"><span class="badge" id="aih-overall-badge">—</span></div>
+          <div style="margin-top:6px;font-size:11px;color:var(--text-muted);">Current Market Regime: <strong id="aih-current-regime" style="color:var(--text-dim);">—</strong></div>
+        </div>
+
+        <!-- Health Cards: Indicator / Scanner / Validation / Learning / Regime -->
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">Health Cards</h4>
+        </div>
+        <div class="small-metrics-grid" id="aih-health-cards">
+          <div class="metric-card"><span class="k">Indicator</span><span class="v"><span class="badge" id="aih-indicator-badge">—</span></span></div>
+          <div class="metric-card"><span class="k">Scanner</span><span class="v"><span class="badge" id="aih-scanner-badge">—</span></span></div>
+          <div class="metric-card"><span class="k">Validation</span><span class="v"><span class="badge" id="aih-validation-badge">—</span></span></div>
+          <div class="metric-card"><span class="k">Learning</span><span class="v"><span class="badge" id="aih-learning-badge">—</span></span></div>
+          <div class="metric-card"><span class="k">Regime</span><span class="v"><span class="badge" id="aih-regime-badge">—</span></span></div>
+        </div>
+
+        <!-- Statistics -->
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">Statistics</h4>
+        </div>
+        <div class="small-metrics-grid" id="aih-stats-grid"></div>
+
+        <!-- Validation / Learning status text -->
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">Validation Status &nbsp;/&nbsp; Learning Status</h4>
+        </div>
+        <div class="glass-card">
+          <div class="history-row" style="border:none;padding:4px 0;">Validation: <span id="aih-validation-status-text" style="color:var(--text-dim);">—</span></div>
+          <div class="history-row" style="border:none;padding:4px 0;">Learning: <span id="aih-learning-status-text" style="color:var(--text-dim);">—</span></div>
+        </div>
+
+        <!-- Best / Worst Indicators -->
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">⭐ Best Indicators &nbsp;/&nbsp; ⚠️ Worst Indicators</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="aih-top-indicators-empty">No indicator has enough accumulated samples yet.</div>
+          <div class="small-metrics-grid" id="aih-top-indicators-grid" hidden></div>
+        </div>
+
+        <!-- Best Assets / Best Timeframes -->
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">🏆 Best Assets &nbsp;/&nbsp; ⏱️ Best Timeframes</h4>
+        </div>
+        <div class="glass-card">
+          <div class="tab-empty small" id="aih-best-groups-empty">No ranked assets/timeframes yet.</div>
+          <div id="aih-best-groups" hidden>
+            <div style="margin-bottom:10px;"><strong style="font-size:11px;color:var(--text-muted);">Best Assets</strong>
+              <div id="aih-best-assets-grid" class="small-metrics-grid" style="margin-top:8px;"></div>
+            </div>
+            <div><strong style="font-size:11px;color:var(--text-muted);">Best Timeframes</strong>
+              <div id="aih-best-timeframes-grid" class="small-metrics-grid" style="margin-top:8px;"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Explain Signal -->
+        <div class="section-head" style="margin-top:20px;">
+          <h4 class="section-title" style="font-size:13px;">💬 Explain a Signal</h4>
+        </div>
+        <div class="glass-card">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <select id="aih-explain-asset" class="chip-toggle" style="flex:1;min-width:140px;"></select>
+            <select id="aih-explain-timeframe" class="chip-toggle" style="min-width:90px;"></select>
+            <button class="tab-refresh-btn" onclick="aihExplainSignal()">Explain</button>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:var(--text-muted);">Leave asset blank to explain the scanner's current top-ranked signal instead.</div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Phase 10.3 Part-2: Explain Signal popup — hand-rolled, reusing existing
+         design tokens (var(--panel)/var(--r-lg)/etc.), same "no new CSS
+         framework" convention as every other page. -->
+    <div class="aih-modal-overlay" id="aih-explain-modal-overlay" hidden onclick="if(event.target===this) aihCloseExplainModal()">
+      <div class="aih-modal glass-card">
+        <div class="section-head">
+          <h4 class="section-title" style="font-size:13px;">Signal Explanation</h4>
+          <button class="tab-refresh-btn" onclick="aihCloseExplainModal()">Close</button>
+        </div>
+        <div id="aih-explain-body"></div>
+      </div>
+    </div>
+
+
+    <footer class="footer">
+      SignalPro · OTC Market Analyzer — for market analysis only, no trades are ever placed.
+    </footer>
+
+    <!-- ══════════════════ BOTTOM NAVIGATION ══════════════════ -->
+    <nav class="bottom-nav">
+      <button class="nav-item active" type="button" data-nav="scanner">
+        <span class="nav-icon">📡</span><span class="nav-label">Scanner</span>
+      </button>
+      <button class="nav-item" type="button" data-nav="analyzer">
+        <span class="nav-icon">🎯</span><span class="nav-label">Analyze</span>
+      </button>
+      <button class="nav-item" type="button" data-nav="signals">
+        <span class="nav-icon">⚡</span><span class="nav-label">Signals</span>
+      </button>
+      <button class="nav-item" type="button" data-nav="history">
+        <span class="nav-icon">🕐</span><span class="nav-label">History</span>
+      </button>
+      <button class="nav-item" type="button" data-nav="settings">
+        <span class="nav-icon">⚙️</span><span class="nav-label">Settings</span>
+      </button>
+    </nav>
+  </div>
+
+  <script>
+    window._OTC_ASSETS      = {{ otc_assets  | tojson }};
+    window._LIVE_ASSETS     = {{ live_assets | tojson }};
+    window._IS_DEMO         = {{ is_demo     | tojson }};
+    window._DEFAULT_ASSET   = {{ default_asset | tojson }};
+    window._DEFAULT_TF      = {{ default_timeframe | tojson }};
+    window._TIMEFRAMES      = {{ timeframes | tojson }};
+    window._VALIDATION_INDICATORS = {{ validation_indicators | tojson }};
+  </script>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
