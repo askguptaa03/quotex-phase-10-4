@@ -624,24 +624,35 @@ function loadSignalsToday() {
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- * AUTO SCANNER
- * Scans a curated set of the most liquid OTC pairs sequentially through the
- * existing /api/signal pipeline (one request at a time — keeps the 2-worker
- * gunicorn backend responsive instead of saturating it with concurrent scans).
+ * AUTO SCANNER (Home dashboard)
+ * Scans the CURRENT LIVE OTC snapshot sequentially through the existing
+ * /api/signal pipeline (one request at a time — keeps the single gunicorn
+ * worker responsive instead of saturating it with concurrent scans).
  * ──────────────────────────────────────────────────────────────────────────── */
 
 function buildScanList() {
-  // Live Asset Availability: once a live fetch has completed, build the
-  // Auto Scanner's target list ONLY from currently-available OTC assets —
-  // never from the static window._OTC_ASSETS universe. Before the first
-  // live fetch resolves, fall back to the static list so the scanner isn't
-  // empty on first paint; buildScanList() is re-run via the live-asset
-  // listener below the moment a live refresh completes.
-  const all = _liveOtcState.loaded ? _liveOtcState.assets : (window._OTC_ASSETS || []);
-  const majors = all.filter((s) => /^[A-Z]{6}_otc$/i.test(s));
-  const extras = all.filter((s) => /^(BTCUSD|ETHUSD|XAUUSD|XAGUSD)_otc$/i.test(s));
-  const list = [...new Set([...majors, ...extras])];
-  return list.slice(0, 16);
+  // Live Asset Availability fix: this used to pre-filter to a hardcoded
+  // 6-letter-symbol regex + a fixed 4-symbol commodity/crypto whitelist,
+  // then cap the result at 16 — meaning the Home dashboard's scan target
+  // was NEVER the actual live OTC count (e.g. it silently dropped any
+  // live symbol that didn't match those patterns, and truncated
+  // everything else to 16 regardless of how many were really live).
+  // That directly violated "live OTC count = scan target" and caused a
+  // fixed ~16-asset ceiling independent of what Quotex actually reports.
+  //
+  // Fixed: scan target is now the live OTC snapshot exactly as-is — no
+  // pattern filter, no cap. If Quotex has 5, this scans 5; 40, this scans
+  // 40; 0, this scans 0. Same rule the backend ScannerEngine already
+  // follows for the Scanner tab (Finding E) — this just brings the Home
+  // dashboard's own scan loop in line with it.
+  //
+  // Before the first live fetch resolves, fall back to the static
+  // window._OTC_ASSETS universe ONLY so the dashboard isn't empty on
+  // first paint — this is a loading placeholder, not a live-availability
+  // fallback: it is replaced the moment the live listener below fires,
+  // including replacing it with an empty list if live discovery reports
+  // zero/unavailable (never silently kept as if it were live).
+  return _liveOtcState.loaded ? [..._liveOtcState.assets] : (window._OTC_ASSETS || []);
 }
 
 let SCAN_LIST = buildScanList();

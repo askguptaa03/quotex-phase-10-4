@@ -666,8 +666,13 @@ class AsyncQuotexClient:
                 for asset in raw_assets or []:
                     try:
                         symbol = str(asset[1])
-                        if "_OTC" in symbol:
-                            symbol = symbol.replace("_OTC", "_otc")
+                        # Normalize the same way get_candles() and
+                        # get_assets_and_payouts() already do, so the key
+                        # this registry exposes is guaranteed to be the
+                        # exact string a subsequent get_candles() call will
+                        # end up using — no mismatch between what's
+                        # advertised as available and what's requested.
+                        symbol = sanitize_symbol(symbol).replace("_OTC", "_otc")
 
                         assets[symbol] = {
                             "id": int(asset[0]) if len(asset) > 0 and asset[0] is not None else 0,

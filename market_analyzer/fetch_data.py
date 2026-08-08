@@ -96,6 +96,12 @@ class QuotexDataFetcher:
         self.is_demo = is_demo
         self._client: Optional[AsyncQuotexClient] = None
         self._live_prices: List[dict] = []
+        # Candle-fetch reliability sequence (Phase 3 fix): the diagnostic
+        # object from the most recent get_candles() call, populated on
+        # both success and failure. Callers (Analyzer/Scanner) can read
+        # this after a call to see exactly what was checked. NEVER
+        # contains the SSID or any secret value — only status labels.
+        self.last_fetch_diagnostics: dict = {}
 
     # ── Connection ───────────────────────────────────────────────────────────
 
@@ -138,27 +144,135 @@ class QuotexDataFetcher:
 
     async def get_candles(self, asset: str | None = None,
                           timeframe: str | None = None,
-                          count: int | None = None) -> List[Candle]:
+                          count: int | None = None,
+                          *, max_retries: int = 2) -> List[Candle]:
         """
         Fetch historical OHLCV candles from Quotex.
         Uses AsyncQuotexClient.get_candles() which reuses the existing
         WebSocket protocol (instruments/follow + instruments/update +
         chart_notification/get) and internal _on_candles_received handler.
+
+        Candle-fetch reliability sequence (Phase 3 fix): a single empty
+        response no longer immediately gives up. On empty/failed:
+          1. re-check current live asset availability (existing
+             get_available_assets() — same live registry Analyzer/Scanner
+             use; never a static fallback)
+          2. verify the requested asset symbol against that live snapshot
+          3. verify the requested timeframe (an omitted timeframe is
+             backfilled from the existing config default, same as before;
+             the diagnostic always reflects the actual resolved value)
+          4. retry with a controlled (exponential) backoff
+          5. if the WebSocket looks dead, reconnect using the EXISTING
+             connect()/disconnect() session architecture — no new auth
+             mechanism, no new reconnection logic invented — then retry
+          6. only after that full sequence still fails is a genuine,
+             structured failure returned
+
+        Never silently substitutes another asset. Never falls back to a
+        static asset list. Never pretends candles were received when they
+        were not — on failure this returns [] exactly as before; the
+        diagnostic detail is additive, in self.last_fetch_diagnostics.
         """
         asset     = asset     or self.asset
         timeframe = timeframe or cfg.PRIMARY_TIMEFRAME
         count     = count     or cfg.CANDLE_COUNT
 
+        diag = {
+            "asset_symbol":           asset,
+            "timeframe":              timeframe,
+            "requested_candle_count": count,
+            "session_status":         "unknown",
+            "websocket_status":       "unknown",
+            "availability_status":    "unknown",
+            "retry_attempts":         0,
+            "failure_reason":         None,
+        }
+        self.last_fetch_diagnostics = diag
+
         if not self._client:
+            diag["session_status"] = "not_connected"
+            diag["websocket_status"] = "not_connected"
+            diag["failure_reason"] = "Not connected. Call connect() first."
             raise RuntimeError("Not connected. Call connect() first.")
 
-        print(f"  → Fetching {count} candles [{timeframe}] for {asset} …")
-        candles = await self._client.get_candles(asset, timeframe, count)
-        if candles:
-            print(f"  → Received {len(candles)} candles ✓")
-        else:
-            print("  ⚠  No candles returned — server may not have this asset/timeframe open.")
-        return candles
+        diag["session_status"] = "connected"
+        # Timeframe verification (step 3): an omitted timeframe/asset/count
+        # is intentionally backfilled from cfg defaults above (pre-existing,
+        # unchanged behavior) — that's a valid request, not a failure. What
+        # IS verified here is that the diagnostic always reflects the
+        # actual, RESOLVED timeframe that will be requested, never a stale
+        # or unresolved value — that's what a caller diagnosing a failure
+        # actually needs to see.
+        diag["timeframe"] = timeframe
+
+        attempt = 0
+        while attempt <= max_retries:
+            diag["websocket_status"] = (
+                "connected" if getattr(self._client, "websocket_is_connected", False)
+                else "disconnected"
+            )
+            print(f"  → Fetching {count} candles [{timeframe}] for {asset} "
+                  f"(attempt {attempt + 1}/{max_retries + 1}) …")
+            try:
+                candles = await self._client.get_candles(asset, timeframe, count)
+            except Exception as exc:  # noqa: BLE001 — recorded, sequence continues
+                candles = []
+                diag["failure_reason"] = f"exception during candle fetch: {exc}"
+
+            if candles:
+                print(f"  → Received {len(candles)} candles ✓")
+                diag["failure_reason"] = None
+                diag["availability_status"] = "available"
+                return candles
+
+            diag["retry_attempts"] = attempt + 1
+
+            # Step 1 + 2: re-check live availability, verify the asset
+            # symbol against it. Same live registry Analyzer/Scanner use
+            # (get_available_assets() — never a static list).
+            try:
+                avail = await self.get_available_assets()
+            except Exception:
+                avail = {}
+            if avail:
+                diag["availability_status"] = "available" if asset in avail else "not_available"
+            else:
+                diag["availability_status"] = "unknown (live discovery unavailable)"
+
+            if diag["availability_status"] == "not_available":
+                # Genuinely not a live asset right now — retrying won't help,
+                # and retrying would waste time without changing the outcome.
+                diag["failure_reason"] = f"Asset '{asset}' is not currently available from Quotex."
+                break
+
+            if attempt >= max_retries:
+                break
+
+            # Step 4/5: controlled backoff, reconnect via the EXISTING
+            # session architecture only if the WebSocket looks dead.
+            backoff = 0.5 * (2 ** attempt)
+            print(f"  ⚠  No candles on attempt {attempt + 1} — retrying in {backoff:.1f}s …")
+            if not getattr(self._client, "websocket_is_connected", False):
+                print("  → WebSocket appears disconnected — reconnecting …")
+                try:
+                    await self.disconnect()
+                    await self.connect()
+                    diag["session_status"] = "reconnected"
+                except Exception as exc:  # noqa: BLE001
+                    diag["session_status"] = "reconnect_failed"
+                    diag["websocket_status"] = "disconnected"
+                    diag["failure_reason"] = f"reconnect failed: {exc}"
+                    break
+            await asyncio.sleep(backoff)
+            attempt += 1
+
+        if not diag["failure_reason"]:
+            diag["failure_reason"] = (
+                f"No candles received for {asset} [{timeframe}] after "
+                f"{diag['retry_attempts']} attempt(s) — asset may be closed or unavailable."
+            )
+        print(f"  ⚠  {diag['failure_reason']}")
+        return []
 
     async def get_candles_df(self, asset: str | None = None,
                              timeframe: str | None = None,
