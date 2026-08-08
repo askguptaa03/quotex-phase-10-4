@@ -30,6 +30,11 @@ if str(_MARKET_DIR) not in sys.path:
 # ── Imports that depend on path setup ────────────────────────────────────────
 from api_quotex import AsyncQuotexClient
 from api_quotex.models import Candle
+from api_quotex.utils import sanitize_symbol  # diagnostic-only: mirrors client.py's own
+                                               # normalization so we can SHOW callers what
+                                               # identifier will actually be used, without
+                                               # changing that logic (which lives in the
+                                               # protected client.py and is untouched here).
 import config as cfg
 
 
@@ -177,13 +182,28 @@ class QuotexDataFetcher:
         timeframe = timeframe or cfg.PRIMARY_TIMEFRAME
         count     = count     or cfg.CANDLE_COUNT
 
+        # Mirrors the EXACT normalization client.py's own get_candles()
+        # and get_available_assets() apply internally — computed here only
+        # to make the identifier flow traceable in diagnostics and to fix
+        # a real bug: the availability re-check below must compare against
+        # this SAME normalized form, not the raw caller-supplied string,
+        # or a live asset can be wrongly declared "not available" purely
+        # because of an incidental formatting difference (case, whitespace)
+        # between what the caller passed and the registry's canonical key.
+        normalized_symbol = sanitize_symbol(asset).replace("_OTC", "_otc")
+
         diag = {
-            "asset_symbol":           asset,
+            "requested_symbol":       asset,
+            "normalized_symbol":      normalized_symbol,
+            "live_registry_symbol":   None,
+            "api_request_identifier": normalized_symbol,
             "timeframe":              timeframe,
             "requested_candle_count": count,
             "session_status":         "unknown",
             "websocket_status":       "unknown",
             "availability_status":    "unknown",
+            "raw_response_type":      None,
+            "raw_response_count":     None,
             "retry_attempts":         0,
             "failure_reason":         None,
         }
@@ -212,12 +232,20 @@ class QuotexDataFetcher:
                 else "disconnected"
             )
             print(f"  → Fetching {count} candles [{timeframe}] for {asset} "
-                  f"(attempt {attempt + 1}/{max_retries + 1}) …")
+                  f"(normalized: {normalized_symbol}, attempt {attempt + 1}/{max_retries + 1}) …")
             try:
+                # asset (raw) is passed through unchanged — client.py's
+                # get_candles() applies the identical sanitize_symbol()
+                # normalization internally; normalized_symbol above is
+                # computed here purely for diagnostic visibility, not to
+                # change what's actually requested.
                 candles = await self._client.get_candles(asset, timeframe, count)
             except Exception as exc:  # noqa: BLE001 — recorded, sequence continues
                 candles = []
                 diag["failure_reason"] = f"exception during candle fetch: {exc}"
+
+            diag["raw_response_type"] = type(candles).__name__
+            diag["raw_response_count"] = len(candles) if hasattr(candles, "__len__") else None
 
             if candles:
                 print(f"  → Received {len(candles)} candles ✓")
@@ -227,22 +255,29 @@ class QuotexDataFetcher:
 
             diag["retry_attempts"] = attempt + 1
 
-            # Step 1 + 2: re-check live availability, verify the asset
-            # symbol against it. Same live registry Analyzer/Scanner use
-            # (get_available_assets() — never a static list).
+            # Step 1 + 2: re-check live availability, verify the NORMALIZED
+            # asset symbol against it (bug fix — previously compared the
+            # raw, un-normalized string, which could falsely read as
+            # "not available" for a genuinely live asset whenever the
+            # caller's string didn't already exactly match the registry's
+            # own canonical key form). Same live registry Analyzer/Scanner
+            # use (get_available_assets() — never a static list).
             try:
                 avail = await self.get_available_assets()
             except Exception:
                 avail = {}
             if avail:
-                diag["availability_status"] = "available" if asset in avail else "not_available"
+                is_live = normalized_symbol in avail
+                diag["availability_status"] = "available" if is_live else "not_available"
+                diag["live_registry_symbol"] = normalized_symbol if is_live else None
             else:
                 diag["availability_status"] = "unknown (live discovery unavailable)"
 
             if diag["availability_status"] == "not_available":
-                # Genuinely not a live asset right now — retrying won't help,
-                # and retrying would waste time without changing the outcome.
-                diag["failure_reason"] = f"Asset '{asset}' is not currently available from Quotex."
+                # Genuinely not a live asset right now (checked against the
+                # NORMALIZED form) — retrying won't help, and retrying
+                # would waste time without changing the outcome.
+                diag["failure_reason"] = f"Asset '{normalized_symbol}' is not currently available from Quotex."
                 break
 
             if attempt >= max_retries:
@@ -268,7 +303,7 @@ class QuotexDataFetcher:
 
         if not diag["failure_reason"]:
             diag["failure_reason"] = (
-                f"No candles received for {asset} [{timeframe}] after "
+                f"No candles received for {normalized_symbol} [{timeframe}] after "
                 f"{diag['retry_attempts']} attempt(s) — asset may be closed or unavailable."
             )
         print(f"  ⚠  {diag['failure_reason']}")

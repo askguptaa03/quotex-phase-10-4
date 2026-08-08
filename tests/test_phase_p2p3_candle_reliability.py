@@ -68,7 +68,7 @@ _get_candles_src = "\n".join(
     line[4:] if line.startswith("    ") else line for line in _get_candles_src.split("\n")
 )
 
-_exec_ns = {"asyncio": asyncio, "cfg": cfg, "print": print}
+_exec_ns = {"asyncio": asyncio, "cfg": cfg, "print": print, "sanitize_symbol": sanitize_symbol}
 # fetch_data.py has `from __future__ import annotations` at module level,
 # so its annotations are never evaluated at runtime there; replicate that
 # here too, since this snippet is exec'd standalone outside that context.
@@ -144,7 +144,8 @@ check("diagnostics never reference the SSID value (source-level sanity)",
       "ssid" not in _fd_src.split("last_fetch_diagnostics: dict = {}")[1][:6000].lower()
       or True)  # see behavioral SSID check below for the real guarantee
 check("last_fetch_diagnostics is a plain dict of status labels, not the SSID itself",
-      '"asset_symbol"' in _fd_src and '"session_status"' in _fd_src
+      '"requested_symbol"' in _fd_src and '"normalized_symbol"' in _fd_src
+      and '"session_status"' in _fd_src
       and '"websocket_status"' in _fd_src and '"availability_status"' in _fd_src
       and '"retry_attempts"' in _fd_src and '"failure_reason"' in _fd_src
       and '"requested_candle_count"' in _fd_src)
@@ -280,11 +281,15 @@ async def _t_permanent_failure_full_diagnostics():
 
 result, diag = run(_t_permanent_failure_full_diagnostics())
 check("permanent failure returns [] (never pretends candles were received)", result == [])
-required_fields = ["session_status", "websocket_status", "asset_symbol", "availability_status",
-                    "timeframe", "requested_candle_count", "retry_attempts", "failure_reason"]
-check("diagnostic object contains all 8 required fields",
+required_fields = ["session_status", "websocket_status", "requested_symbol", "normalized_symbol",
+                    "live_registry_symbol", "api_request_identifier", "availability_status",
+                    "timeframe", "requested_candle_count", "raw_response_type", "raw_response_count",
+                    "retry_attempts", "failure_reason"]
+check("diagnostic object contains all required fields (session/websocket/symbol/availability/"
+      "timeframe/count/raw-response/retries/failure-reason)",
       all(field in diag for field in required_fields))
-check("diagnostic asset_symbol matches the requested asset", diag["asset_symbol"] == "EURUSD_otc")
+check("diagnostic requested_symbol matches the requested asset", diag["requested_symbol"] == "EURUSD_otc")
+check("diagnostic normalized_symbol matches the sanitized form", diag["normalized_symbol"] == "EURUSD_otc")
 check("diagnostic timeframe matches the requested timeframe", diag["timeframe"] == "1m")
 check("diagnostic requested_candle_count matches the requested count",
       diag["requested_candle_count"] == 100)
@@ -363,6 +368,97 @@ async def _t_ssid_never_in_diagnostics():
 
 check("QUOTEX_SSID value never appears in the diagnostic object, even on failure",
       run(_t_ssid_never_in_diagnostics()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n=== USD/INR (OTC) reproduction — live asset falsely reported unavailable ===")
+# ═══════════════════════════════════════════════════════════════════════════
+# Reproduces the reported production bug: Quotex shows an asset as live and
+# actively moving, but Analyzer reports "No candles received ... may be
+# closed or unavailable". Root cause found by inspection (not assumption):
+# the availability re-check compared the RAW caller-supplied symbol
+# directly against the live registry, instead of the same NORMALIZED form
+# the registry itself now stores (post client.py fix). Any caller-side
+# formatting difference — case, incidental whitespace, or any other
+# variant of the same asset's string — caused a false "not_available"
+# verdict and an immediate give-up with zero retries, even though the
+# asset was genuinely live under its canonical registry key.
+#
+# This test is intentionally GENERIC — it exercises the mechanism using
+# five different currency pairs (including the reported USDINR case) and a
+# deliberately "differently-formatted" caller-supplied string for each, to
+# prove the fix is general and not a USDINR special-case.
+REPRODUCTION_PAIRS = [
+    ("USDINR_otc", "usdinr_OTC"),   # the exact reported production case
+    ("USDCAD_otc", "usdcad_OTC"),
+    ("USDJPY_otc", "USDJPY_OTC"),
+    ("EURUSD_otc", "  eurusd_otc  "),
+    ("AUDUSD_otc", "audusd_otc"),
+]
+
+
+async def _t_live_asset_not_falsely_reported_unavailable(canonical_symbol, caller_supplied_symbol):
+    """
+    The live registry stores ONLY the canonical form (exactly what
+    client.py's get_available_assets() now produces after the sanitize_symbol
+    fix). The caller passes a differently-formatted — but referring to the
+    exact same real asset — string, simulating any incidental formatting
+    difference between what Analyzer/Scanner passes in and the registry's
+    own key. Before this fix, this would have been misread as "not
+    available" on the very first empty response, with zero retries.
+    """
+    fc = FakeAsyncQuotexClient(
+        candle_sequence=[[], ["recovered_after_correct_availability_check"]],
+        assets_snapshot={canonical_symbol: {}},  # registry has ONLY the canonical form
+        ws_connected=True,
+    )
+    f = make_fetcher(fc)
+    result = await f.get_candles(caller_supplied_symbol, "1m", 100)
+    return result, f.last_fetch_diagnostics
+
+
+for canonical, caller_variant in REPRODUCTION_PAIRS:
+    result, diag = run(_t_live_asset_not_falsely_reported_unavailable(canonical, caller_variant))
+    check(f"{canonical}: live asset is NOT falsely reported unavailable "
+          f"(caller passed {caller_variant!r})",
+          result == ["recovered_after_correct_availability_check"])
+    check(f"{canonical}: normalized_symbol in diagnostics matches the registry's canonical key",
+          diag["normalized_symbol"] == canonical)
+    check(f"{canonical}: availability_status correctly reports 'available', not 'not_available'",
+          diag["availability_status"] == "available")
+    check(f"{canonical}: live_registry_symbol confirms the match against the live snapshot",
+          diag["live_registry_symbol"] == canonical)
+    check(f"{canonical}: at least one retry actually happened (not an immediate false give-up)",
+          diag["retry_attempts"] >= 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n=== Full identifier round-trip: live registry -> Analyzer/Scanner -> candle request ===")
+# ═══════════════════════════════════════════════════════════════════════════
+async def _t_full_identifier_roundtrip(canonical_symbol):
+    """
+    End-to-end: the live registry reports `canonical_symbol` as available.
+    Analyzer/Scanner selects that EXACT string (this is what app.py's
+    live-sourced dropdowns/scanner already guarantee — see
+    test_phase_10_4_scan_target_fix.py). The candle request must then use
+    the identical identifier — api_request_identifier in the diagnostics —
+    with no silent divergence anywhere in the chain.
+    """
+    fc = FakeAsyncQuotexClient(candle_sequence=[["ok"]], assets_snapshot={canonical_symbol: {}})
+    f = make_fetcher(fc)
+    # Analyzer/Scanner passes the registry's own key straight through —
+    # the realistic, common case (not a reformatted variant).
+    result = await f.get_candles(canonical_symbol, "1m", 100)
+    return result, f.last_fetch_diagnostics
+
+
+for canonical, _ in REPRODUCTION_PAIRS:
+    result, diag = run(_t_full_identifier_roundtrip(canonical))
+    check(f"{canonical}: full round-trip succeeds with no identifier divergence",
+          result == ["ok"])
+    check(f"{canonical}: requested_symbol == normalized_symbol == api_request_identifier "
+          f"(no silent divergence anywhere in the chain)",
+          diag["requested_symbol"] == diag["normalized_symbol"] == diag["api_request_identifier"] == canonical)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
