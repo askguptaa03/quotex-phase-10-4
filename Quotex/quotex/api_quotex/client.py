@@ -118,6 +118,16 @@ class AsyncQuotexClient:
         self._assets_data: Dict[str, Dict[str, Any]] = {}
         self._assets_requests: Dict[str, asyncio.Future] = {}
         self._candle_requests: Dict[str, asyncio.Future] = {}
+        # Approved general fix — protocol errors during an in-flight candle
+        # request were previously silently discarded by _on_error(),
+        # leaving the pending future to sit until the full timeout. These
+        # two structures let a genuinely-correlated error resolve its
+        # exact (asset, timeframe) request immediately, and let an
+        # error that can't be reliably correlated still be surfaced as a
+        # soft diagnostic hint — without ever guessing which request it
+        # belongs to (see _on_error() and get_last_candle_error() below).
+        self._candle_request_errors: Dict[str, Dict[str, Any]] = {}
+        self._recent_uncorrelated_candle_errors: List[Dict[str, Any]] = []
         self._balance_requests: Dict[str, asyncio.Future] = {}
         self._payout_data: Dict[str, float] = {}
         self._server_time: Optional[ServerTime] = None
@@ -1011,6 +1021,35 @@ class AsyncQuotexClient:
             logger.error(f"Error fetching candles for {sym}: {e}")
             return []
 
+    def get_last_candle_error(self, asset: str, timeframe: Union[str, int]) -> Optional[Dict[str, Any]]:
+        """
+        Approved general fix — returns (and consumes) the most recent
+        outcome recorded for this exact (asset, timeframe) candle
+        request, if any. Shape: {"error", "message", "timestamp", "kind"}
+        where kind is one of "protocol_error" (a real, correlated server
+        error — never a guess), "timeout" (no response at all within the
+        window), or "empty_response" (a response arrived, resolved
+        successfully, but was empty — no error). Only ever returns
+        information for THIS exact request; never another asset/timeframe's
+        outcome. Safe to call right after get_candles() returns an empty
+        result, to distinguish these cases from each other.
+        """
+        tf_secs = TIMEFRAMES.get(timeframe, 60) if isinstance(timeframe, str) else int(timeframe)
+        sym = sanitize_symbol(asset).replace("_OTC", "_otc")
+        rid = f"{sym}_{tf_secs}"
+        return self._candle_request_errors.pop(rid, None)
+
+    def get_recent_uncorrelated_candle_errors(self, since_ts: float) -> List[Dict[str, Any]]:
+        """
+        Protocol errors observed that could NOT be reliably tied to a
+        specific candle request (the server's error payload lacked
+        asset/period context). Returned only as a soft, clearly-labeled
+        hint for diagnostics — never used to resolve/short-circuit any
+        specific request, since which request (if any) it belongs to
+        can't be proven.
+        """
+        return [e for e in self._recent_uncorrelated_candle_errors if e.get("timestamp", 0) >= since_ts]
+
     async def get_candles_dataframe(self, asset: str, timeframe: Union[str, int],
                                     count: int = 100, end_time: Optional[datetime] = None) -> pd.DataFrame:
         candles = await self.get_candles(asset, timeframe, count, end_time)
@@ -1053,10 +1092,23 @@ class AsyncQuotexClient:
             await self.request_chart_notifications(asset)
             timeout = max(10.0, float(getattr(self._config.trading, "default_timeout", 10)))
             candles = await asyncio.wait_for(candle_future, timeout=timeout)
+            if not candles:
+                # Minimal extension of the same approved error-propagation
+                # mechanism: record that this request resolved successfully
+                # but empty (no protocol error occurred) — distinct from a
+                # true timeout below. setdefault() so this NEVER overwrites
+                # a genuine correlated protocol error _on_error() may have
+                # already recorded for this exact rid (that takes priority).
+                self._candle_request_errors.setdefault(request_id, {
+                    "error": None, "message": None, "timestamp": time.time(), "kind": "empty_response",
+                })
             return candles[-count:] if isinstance(candles, list) and count else candles
         except asyncio.TimeoutError:
             if self.enable_logging:
                 logger.warning(f"Candle request timed out for {asset} / {timeframe}")
+            self._candle_request_errors.setdefault(request_id, {
+                "error": None, "message": "timeout: no response received", "timestamp": time.time(), "kind": "timeout",
+            })
             return []
         finally:
             # Let _on_candles_received own completion; just cleanup mapping here
@@ -1631,6 +1683,48 @@ class AsyncQuotexClient:
                 self._pending_order_requests.pop(req_id, None)
                 logger.warning(f"Order error received for requestId={req_id}: {data.get('message') or data.get('error')}")
         except Exception:
+            pass
+
+        # Approved general fix — candle-request protocol error correlation.
+        # Order-error handling above is untouched. This is additive and
+        # only concerns self._candle_requests / self._candle_request_errors,
+        # never self._pending_order_requests or order futures.
+        try:
+            err_asset = data.get("asset") if isinstance(data, dict) else None
+            err_period = data.get("period") if isinstance(data, dict) else None
+            # Deliberately excludes QUOTEX_SSID/credentials/cookies/headers —
+            # only the server's own error/message text and timing, same
+            # shape as what's already logged above.
+            safe_error = {
+                "error": data.get("error") if isinstance(data, dict) else None,
+                "message": data.get("message") if isinstance(data, dict) else None,
+                "timestamp": time.time(),
+                "kind": "protocol_error",
+            }
+            if err_asset is not None and err_period is not None:
+                # Reliable correlation: the server echoed asset+period,
+                # exactly like a real candle response does — safe to tie
+                # to that EXACT pending request only (never a different
+                # one), matching self._candle_requests' own keying.
+                rid = f"{err_asset}_{int(err_period)}"
+                self._candle_request_errors[rid] = safe_error
+                waiter = self._candle_requests.get(rid)
+                if waiter and not waiter.done():
+                    # Resolve immediately (empty result) instead of letting
+                    # the caller wait out the full timeout for a request
+                    # the server already told us failed. _request_candles()
+                    # still returns [] on this path (unchanged contract);
+                    # get_last_candle_error() lets the caller find out why.
+                    waiter.set_result([])
+            else:
+                # Cannot reliably tell which in-flight request (if any)
+                # this belongs to — never guess/attach it to one. Recorded
+                # only as a soft, timestamped, clearly-uncorrelated hint;
+                # bounded so it can't grow unboundedly.
+                self._recent_uncorrelated_candle_errors.append(safe_error)
+                self._recent_uncorrelated_candle_errors = self._recent_uncorrelated_candle_errors[-5:]
+        except Exception:
+            # Never let this diagnostic bookkeeping break error handling.
             pass
 
         await self._emit_event("error", data)

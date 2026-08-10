@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import os
 import json
+import time
 import asyncio
 from pathlib import Path
 from typing import List, Optional, Callable, Any
@@ -205,6 +206,12 @@ class QuotexDataFetcher:
             "raw_response_type":      None,
             "raw_response_count":     None,
             "retry_attempts":         0,
+            # One of: "protocol_error", "timeout", "unavailable",
+            # "empty_response", "connection_error", or None on success.
+            # Populated below from the approved client.py error-
+            # correlation mechanism wherever that signal is available;
+            # never guessed.
+            "failure_category":       None,
             "failure_reason":         None,
         }
         self.last_fetch_diagnostics = diag
@@ -212,7 +219,8 @@ class QuotexDataFetcher:
         if not self._client:
             diag["session_status"] = "not_connected"
             diag["websocket_status"] = "not_connected"
-            diag["failure_reason"] = "Not connected. Call connect() first."
+            diag["failure_category"] = "connection_error"
+            diag["failure_reason"] = "connection_error: not connected. Call connect() first."
             raise RuntimeError("Not connected. Call connect() first.")
 
         diag["session_status"] = "connected"
@@ -233,6 +241,7 @@ class QuotexDataFetcher:
             )
             print(f"  → Fetching {count} candles [{timeframe}] for {asset} "
                   f"(normalized: {normalized_symbol}, attempt {attempt + 1}/{max_retries + 1}) …")
+            attempt_started_at = time.time()
             try:
                 # asset (raw) is passed through unchanged — client.py's
                 # get_candles() applies the identical sanitize_symbol()
@@ -249,9 +258,55 @@ class QuotexDataFetcher:
 
             if candles:
                 print(f"  → Received {len(candles)} candles ✓")
+                diag["failure_category"] = None
                 diag["failure_reason"] = None
                 diag["availability_status"] = "available"
                 return candles
+
+            # Approved general fix — consume the correlated outcome
+            # client.py's _on_error()/_request_candles() recorded for THIS
+            # exact (asset, timeframe) request, if any. Distinguishes a
+            # real server-side protocol error from a plain timeout from a
+            # genuinely-empty-but-valid response — never guessed, only
+            # ever what the server/client actually reported for this
+            # specific request.
+            client_outcome = None
+            try:
+                if hasattr(self._client, "get_last_candle_error"):
+                    client_outcome = self._client.get_last_candle_error(asset, timeframe)
+            except Exception:
+                client_outcome = None
+
+            if client_outcome:
+                kind = client_outcome.get("kind")
+                if kind == "protocol_error":
+                    diag["failure_category"] = "protocol_error"
+                    err_detail = client_outcome.get("error") or client_outcome.get("message") or "unspecified"
+                    diag["failure_reason"] = f"protocol_error: Quotex reported an error for this request: {err_detail}"
+                elif kind == "timeout":
+                    diag["failure_category"] = "timeout"
+                    diag["failure_reason"] = "timeout: no response received from Quotex within the request window."
+                elif kind == "empty_response":
+                    diag["failure_category"] = "empty_response"
+                    diag["failure_reason"] = "empty_response: Quotex responded successfully but returned zero candles."
+            else:
+                # No directly-correlated outcome available (older client,
+                # or nothing recorded yet) — check for a recent protocol
+                # error that couldn't be tied to a specific request, as a
+                # soft, clearly-labeled hint only. Never used to short-
+                # circuit retries or override a more specific category.
+                try:
+                    if hasattr(self._client, "get_recent_uncorrelated_candle_errors"):
+                        uncorrelated = self._client.get_recent_uncorrelated_candle_errors(attempt_started_at)
+                        if uncorrelated and not diag["failure_reason"]:
+                            latest = uncorrelated[-1]
+                            diag["failure_category"] = "protocol_error"
+                            diag["failure_reason"] = (
+                                "protocol_error (uncorrelated — could not be tied to this exact request): "
+                                f"{latest.get('error') or latest.get('message') or 'unspecified'}"
+                            )
+                except Exception:
+                    pass
 
             diag["retry_attempts"] = attempt + 1
 
@@ -276,8 +331,12 @@ class QuotexDataFetcher:
             if diag["availability_status"] == "not_available":
                 # Genuinely not a live asset right now (checked against the
                 # NORMALIZED form) — retrying won't help, and retrying
-                # would waste time without changing the outcome.
-                diag["failure_reason"] = f"Asset '{normalized_symbol}' is not currently available from Quotex."
+                # would waste time without changing the outcome. This is a
+                # definitive, retry-pointless terminal state — takes
+                # priority over any softer protocol_error/timeout guess
+                # recorded above for this same attempt.
+                diag["failure_category"] = "unavailable"
+                diag["failure_reason"] = f"unavailable: asset '{normalized_symbol}' is not currently available from Quotex."
                 break
 
             if attempt >= max_retries:
@@ -296,14 +355,16 @@ class QuotexDataFetcher:
                 except Exception as exc:  # noqa: BLE001
                     diag["session_status"] = "reconnect_failed"
                     diag["websocket_status"] = "disconnected"
-                    diag["failure_reason"] = f"reconnect failed: {exc}"
+                    diag["failure_category"] = "connection_error"
+                    diag["failure_reason"] = f"connection_error: reconnect failed: {exc}"
                     break
             await asyncio.sleep(backoff)
             attempt += 1
 
         if not diag["failure_reason"]:
+            diag["failure_category"] = diag["failure_category"] or "timeout"
             diag["failure_reason"] = (
-                f"No candles received for {normalized_symbol} [{timeframe}] after "
+                f"timeout: no candles received for {normalized_symbol} [{timeframe}] after "
                 f"{diag['retry_attempts']} attempt(s) — asset may be closed or unavailable."
             )
         print(f"  ⚠  {diag['failure_reason']}")

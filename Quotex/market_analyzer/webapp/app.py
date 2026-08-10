@@ -328,8 +328,30 @@ async def _run_pipeline(asset: str, timeframe: str) -> Dict[str, Any]:
         t = _log_step(f"get_candles_df({timeframe})", t0, t)
 
         if df.empty:
-            return {"error": f"No candles received for {asset} [{timeframe}]. "
-                              "The asset may be closed or unavailable right now."}
+            # Approved general fix — surface fetcher.last_fetch_diagnostics
+            # instead of always returning the same generic string,
+            # regardless of the ACTUAL reason (protocol error, timeout,
+            # genuinely unavailable, empty-but-valid response, or a
+            # connection/reconnect failure). "error" stays a plain string
+            # (app.js renders it directly in several places, e.g. line
+            # ~1051/3145 `${data.error}` / `.join('; ')`) so the existing
+            # UI keeps working unchanged — its CONTENT is just more
+            # specific now. "diagnostics" is a new, additive key with the
+            # full structured object for anything that wants it
+            # programmatically; nothing currently reads it, so this can't
+            # break existing behavior. NEVER includes QUOTEX_SSID or any
+            # credential — last_fetch_diagnostics never captures that.
+            diag = getattr(fetcher, "last_fetch_diagnostics", None) or {}
+            category = diag.get("failure_category")
+            reason = diag.get("failure_reason") or (
+                f"No candles received for {asset} [{timeframe}]. "
+                "The asset may be closed or unavailable right now."
+            )
+            return {
+                "error": reason,
+                "failure_category": category,
+                "diagnostics": diag,
+            }
 
         otc_settings = cfg.get_indicator_settings(asset)
         indicators = calculate_all(

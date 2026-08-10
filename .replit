@@ -1,0 +1,20 @@
+modules = ["python-base-3.13"]
+
+# NOTE: The deployment TYPE (Reserved VM vs Autoscale vs Static) is
+# selected in the Replit Deploy tab UI when you click "Deploy" — it is
+# not reliably settable to Reserved VM from this file (Replit's public
+# .replit schema documentation does not confirm a stable deploymentTarget
+# string for Reserved VM at the time this file was generated, and this
+# project deliberately avoids guessing at unconfirmed config syntax).
+# This app REQUIRES Reserved VM (single, persistent instance) — see
+# DEPLOYMENT_README.md for why, and select it manually in the Deploy tab.
+[deployment]
+run = ["bash", "start-prod.sh"]
+
+[nix]
+channel = "stable-25_05"
+packages = ["cacert", "gitFull", "glibcLocales", "libxcrypt", "playwright-driver"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80

@@ -16,6 +16,7 @@ Run with: python3 Quotex/tests/test_phase_p2p3_candle_reliability.py
 import sys
 import os
 import re
+import time
 import types
 import asyncio
 
@@ -68,7 +69,7 @@ _get_candles_src = "\n".join(
     line[4:] if line.startswith("    ") else line for line in _get_candles_src.split("\n")
 )
 
-_exec_ns = {"asyncio": asyncio, "cfg": cfg, "print": print, "sanitize_symbol": sanitize_symbol}
+_exec_ns = {"asyncio": asyncio, "cfg": cfg, "print": print, "sanitize_symbol": sanitize_symbol, "time": time}
 # fetch_data.py has `from __future__ import annotations` at module level,
 # so its annotations are never evaluated at runtime there; replicate that
 # here too, since this snippet is exec'd standalone outside that context.
@@ -147,8 +148,8 @@ check("last_fetch_diagnostics is a plain dict of status labels, not the SSID its
       '"requested_symbol"' in _fd_src and '"normalized_symbol"' in _fd_src
       and '"session_status"' in _fd_src
       and '"websocket_status"' in _fd_src and '"availability_status"' in _fd_src
-      and '"retry_attempts"' in _fd_src and '"failure_reason"' in _fd_src
-      and '"requested_candle_count"' in _fd_src)
+      and '"retry_attempts"' in _fd_src and '"failure_category"' in _fd_src
+      and '"failure_reason"' in _fd_src and '"requested_candle_count"' in _fd_src)
 
 _client_src = open(os.path.join(_QUOTEX_DIR, "api_quotex", "client.py"), encoding="utf-8").read()
 check("client.py's get_available_assets() now calls sanitize_symbol() (approved fix applied)",
@@ -171,17 +172,46 @@ for raw in ["usdjpy_OTC", "EURUSD_otc", "  gbpusd_otc  ", "BTCUSD_OTC"]:
 # ═══════════════════════════════════════════════════════════════════════════
 print("\n=== candle-fetch reliability sequence (behavioral, FakeClient) ===")
 # ═══════════════════════════════════════════════════════════════════════════
+# Local copy of the timeframe->seconds mapping, used ONLY for this fake
+# client's own internal rid bookkeeping (mirrors constants.py's real
+# TIMEFRAMES table structurally) — not the thing under test, so no need to
+# extract it from the protected source; the real mapping is exercised
+# separately in the "all timeframes" test further down via the actual
+# extracted get_candles() + real client.py's own TIMEFRAMES-based logic.
+_FAKE_TF_SECONDS = {"30s": 30, "1m": 60, "2m": 120, "3m": 180, "5m": 300,
+                     "10m": 600, "15m": 900, "30m": 1800, "45m": 2700, "1h": 3600}
+
+
 class FakeAsyncQuotexClient:
     """OFFLINE MOCK — never touches the network. Simulates the exact
-    surface QuotexDataFetcher.get_candles() actually calls."""
-    def __init__(self, candle_sequence, assets_snapshot=None, ws_connected=True):
-        self._candle_sequence = list(candle_sequence)  # one list per call
+    surface QuotexDataFetcher.get_candles() actually calls, INCLUDING the
+    new get_last_candle_error()/get_recent_uncorrelated_candle_errors()
+    surface client.py now exposes (same method names/signatures/semantics
+    as the real approved fix) — so fetch_data.py's real, extracted
+    get_candles() exercises the real correlation-consuming code path,
+    not a stand-in that happens to always return None."""
+    def __init__(self, candle_sequence=None, assets_snapshot=None, ws_connected=True,
+                 per_asset_candles=None, candle_errors=None, uncorrelated_errors=None):
+        self._candle_sequence = list(candle_sequence or [])  # one list per call (single-asset tests)
+        self.per_asset_candles = {k: list(v) for k, v in (per_asset_candles or {}).items()}  # concurrency tests
         self._assets_snapshot = assets_snapshot or {}
         self.websocket_is_connected = ws_connected
         self.connect_calls = 0
         self.disconnect_calls = 0
+        # rid ("SYMBOL_seconds") -> error dict, mirrors client.py's
+        # self._candle_request_errors exactly.
+        self._candle_errors = dict(candle_errors or {})
+        self._uncorrelated_errors = list(uncorrelated_errors or [])
+
+    def _rid(self, asset, timeframe):
+        tf_secs = _FAKE_TF_SECONDS.get(timeframe, 60) if isinstance(timeframe, str) else int(timeframe)
+        sym = sanitize_symbol(asset).replace("_OTC", "_otc")
+        return f"{sym}_{tf_secs}"
 
     async def get_candles(self, asset, timeframe, count):
+        if asset in self.per_asset_candles:
+            seq = self.per_asset_candles[asset]
+            return seq.pop(0) if seq else []
         if self._candle_sequence:
             return self._candle_sequence.pop(0)
         return []
@@ -197,6 +227,13 @@ class FakeAsyncQuotexClient:
     async def disconnect(self):
         self.disconnect_calls += 1
         self.websocket_is_connected = False
+
+    # ── same surface as the real, approved client.py fix ──────────────────
+    def get_last_candle_error(self, asset, timeframe):
+        return self._candle_errors.pop(self._rid(asset, timeframe), None)
+
+    def get_recent_uncorrelated_candle_errors(self, since_ts):
+        return [e for e in self._uncorrelated_errors if e.get("timestamp", 0) >= since_ts]
 
 
 def make_fetcher(fake_client):
@@ -264,6 +301,8 @@ result, diag = run(_t_genuinely_unavailable())
 check("genuinely unavailable asset returns [] (never fabricated candles)", result == [])
 check("availability_status correctly reports not_available",
       diag["availability_status"] == "not_available")
+check("failure_category correctly classified as 'unavailable'",
+      diag["failure_category"] == "unavailable")
 check("failure_reason clearly states the asset is not currently available",
       "not currently available" in diag["failure_reason"])
 check("does not silently substitute another asset's candles",
@@ -284,9 +323,9 @@ check("permanent failure returns [] (never pretends candles were received)", res
 required_fields = ["session_status", "websocket_status", "requested_symbol", "normalized_symbol",
                     "live_registry_symbol", "api_request_identifier", "availability_status",
                     "timeframe", "requested_candle_count", "raw_response_type", "raw_response_count",
-                    "retry_attempts", "failure_reason"]
+                    "retry_attempts", "failure_category", "failure_reason"]
 check("diagnostic object contains all required fields (session/websocket/symbol/availability/"
-      "timeframe/count/raw-response/retries/failure-reason)",
+      "timeframe/count/raw-response/retries/failure-category/failure-reason)",
       all(field in diag for field in required_fields))
 check("diagnostic requested_symbol matches the requested asset", diag["requested_symbol"] == "EURUSD_otc")
 check("diagnostic normalized_symbol matches the sanitized form", diag["normalized_symbol"] == "EURUSD_otc")
@@ -295,6 +334,8 @@ check("diagnostic requested_candle_count matches the requested count",
       diag["requested_candle_count"] == 100)
 check("diagnostic retry_attempts reflects the full sequence (3 attempts: initial + 2 retries)",
       diag["retry_attempts"] == 3)
+check("diagnostic failure_category is set to a real category (not None) on failure",
+      diag["failure_category"] is not None)
 check("diagnostic failure_reason is set and human-readable",
       isinstance(diag["failure_reason"], str) and len(diag["failure_reason"]) > 0)
 
@@ -459,6 +500,286 @@ for canonical, _ in REPRODUCTION_PAIRS:
     check(f"{canonical}: requested_symbol == normalized_symbol == api_request_identifier "
           f"(no silent divergence anywhere in the chain)",
           diag["requested_symbol"] == diag["normalized_symbol"] == diag["api_request_identifier"] == canonical)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n=== AUD/CAD protocol-error investigation — general fix (E1/E2/E3) ===")
+# ═══════════════════════════════════════════════════════════════════════════
+# Reproduces the reported production bug: Quotex shows AUD/CAD as live and
+# actively moving, but Analyzer still reports "No candles received ... may
+# be closed or unavailable" with zero detail about WHY. Root cause found
+# by inspection: (1) app.py never surfaced fetcher.last_fetch_diagnostics
+# at all — every failure showed the same generic string regardless of
+# cause; (2) client.py's _on_error() silently discarded genuine
+# protocol-level errors during an in-flight candle request instead of
+# resolving the pending future, so a real server-side rejection was
+# indistinguishable from a plain timeout. Both fixes are asset-agnostic —
+# tested below with AUDCAD_otc and USDINR_otc together (concurrently) plus
+# a separate generic asset, never as an AUDCAD-only special case.
+
+# A. Empty candles -> structured diagnostics available for the API layer to expose.
+async def _t_empty_candles_structured_diagnostics():
+    fc = FakeAsyncQuotexClient(candle_sequence=[[], [], []], assets_snapshot={"EURUSD_otc": {}})
+    f = make_fetcher(fc)
+    result = await f.get_candles("EURUSD_otc", "1m", 100, max_retries=2)
+    return result, f.last_fetch_diagnostics
+
+
+result, diag = run(_t_empty_candles_structured_diagnostics())
+check("A. empty candles: result is [] (never fabricated)", result == [])
+check("A. empty candles: last_fetch_diagnostics is a populated, structured dict "
+      "(this is exactly what app.py's df.empty branch now reads and returns as "
+      "response['diagnostics'] instead of a bare generic string)",
+      isinstance(diag, dict) and diag.get("failure_category") is not None
+      and isinstance(diag.get("failure_reason"), str))
+
+
+# B/C. Protocol error during an in-flight request resolves promptly (does NOT
+#      wait for the full timeout) and is classified as failure_category="protocol_error".
+async def _t_protocol_error_resolves_promptly_and_classified():
+    fc = FakeAsyncQuotexClient(
+        candle_sequence=[[]],  # first attempt "empty" — represents the future
+                               # having been resolved with [] by _on_error()
+                               # rather than genuinely timing out
+        assets_snapshot={"AUDCAD_otc": {}},
+        candle_errors={"AUDCAD_otc_60": {
+            "error": "asset_rejected", "message": "AUDCAD candle subscription was rejected",
+            "timestamp": time.time(), "kind": "protocol_error",
+        }},
+    )
+    f = make_fetcher(fc)
+    start = time.time()
+    result = await f.get_candles("AUDCAD_otc", "1m", 100, max_retries=0)
+    elapsed = time.time() - start
+    return result, f.last_fetch_diagnostics, elapsed
+
+
+result, diag, elapsed = run(_t_protocol_error_resolves_promptly_and_classified())
+check("B. protocol error resolves promptly — test itself completes near-instantly "
+      "(no real 10s+ timeout was waited on; the FakeClient's future would have "
+      "been resolved immediately by _on_error() in the real client)",
+      elapsed < 2.0)
+check("C. protocol error is classified as failure_category == 'protocol_error'",
+      diag["failure_category"] == "protocol_error")
+check("C. protocol error content ('asset_rejected') is present in failure_reason",
+      "asset_rejected" in diag["failure_reason"])
+
+
+# D. No response until timeout, with NO protocol error recorded, stays classified as "timeout".
+async def _t_pure_timeout_classified():
+    fc = FakeAsyncQuotexClient(candle_sequence=[[], [], []], assets_snapshot={"EURUSD_otc": {}})
+    f = make_fetcher(fc)  # no candle_errors / uncorrelated_errors configured at all
+    result = await f.get_candles("EURUSD_otc", "1m", 100, max_retries=2)
+    return result, f.last_fetch_diagnostics
+
+
+result, diag = run(_t_pure_timeout_classified())
+check("D. no response and no protocol error -> failure_category == 'timeout'",
+      diag["failure_category"] == "timeout")
+check("D. timeout failure_reason is self-labeled 'timeout:'", diag["failure_reason"].startswith("timeout:"))
+
+
+# E. Genuinely unavailable asset is classified as failure_category == "unavailable"
+#    (re-verifies the earlier not_available test's category explicitly).
+async def _t_unavailable_classified():
+    fc = FakeAsyncQuotexClient(candle_sequence=[[]], assets_snapshot={"OTHERASSET_otc": {}})
+    f = make_fetcher(fc)
+    result = await f.get_candles("EURUSD_otc", "1m", 100)
+    return result, f.last_fetch_diagnostics
+
+
+result, diag = run(_t_unavailable_classified())
+check("E. genuinely unavailable asset -> failure_category == 'unavailable'",
+      diag["failure_category"] == "unavailable")
+check("E. unavailable failure_reason is self-labeled 'unavailable:'",
+      diag["failure_reason"].startswith("unavailable:"))
+
+
+# F. A valid request that gets a genuinely empty (but successfully-resolved,
+#    no error) response is classified as failure_category == "empty_response".
+async def _t_empty_response_classified():
+    fc = FakeAsyncQuotexClient(
+        candle_sequence=[[], [], []], assets_snapshot={"EURUSD_otc": {}},
+        # get_last_candle_error() will return a "kind": "empty_response"
+        # marker for the FIRST attempt only, matching what the real
+        # client.py now records when a future resolves successfully but
+        # empty (see _request_candles()'s new `if not candles: setdefault(...)`).
+        candle_errors={"EURUSD_otc_60": {
+            "error": None, "message": None, "timestamp": time.time(), "kind": "empty_response",
+        }},
+    )
+    f = make_fetcher(fc)
+    result = await f.get_candles("EURUSD_otc", "1m", 100, max_retries=0)
+    return result, f.last_fetch_diagnostics
+
+
+result, diag = run(_t_empty_response_classified())
+check("F. genuinely empty (no-error) response -> failure_category == 'empty_response'",
+      diag["failure_category"] == "empty_response")
+check("F. empty_response failure_reason is self-labeled 'empty_response:'",
+      diag["failure_reason"].startswith("empty_response:"))
+
+
+# G. Connection/reconnect failure is classified as failure_category == "connection_error".
+async def _t_connection_error_classified():
+    class ReconnectFailsClient(FakeAsyncQuotexClient):
+        async def connect(self):
+            raise ConnectionError("simulated reconnect failure")
+
+    fc = ReconnectFailsClient(candle_sequence=[[], []], assets_snapshot={"EURUSD_otc": {}},
+                               ws_connected=False)
+    f = make_fetcher(fc)
+    result = await f.get_candles("EURUSD_otc", "1m", 100, max_retries=1)
+    return result, f.last_fetch_diagnostics
+
+
+result, diag = run(_t_connection_error_classified())
+check("G. reconnect failure -> failure_category == 'connection_error'",
+      diag["failure_category"] == "connection_error")
+check("G. connection_error failure_reason is self-labeled 'connection_error:'",
+      diag["failure_reason"].startswith("connection_error:"))
+check("G. connection_error failure_reason mentions the underlying exception",
+      "simulated reconnect failure" in diag["failure_reason"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n=== H. Concurrency — AUDCAD_otc + USDINR_otc simultaneously ===")
+# ═══════════════════════════════════════════════════════════════════════════
+# ONE shared fake client, mirroring production's single shared
+# AsyncQuotexClient serving multiple concurrent candle requests (e.g. two
+# Manual Analyzer requests, or Scanner fetching several assets close
+# together). A protocol error is injected for AUDCAD_otc ONLY. USDINR_otc
+# must succeed completely independently — no cross-request contamination,
+# no wrong future resolved. This is the exact scenario item 4 requires.
+async def _t_concurrent_requests_no_cross_contamination():
+    shared_client = FakeAsyncQuotexClient(
+        assets_snapshot={"AUDCAD_otc": {}, "USDINR_otc": {}},
+        ws_connected=True,
+        per_asset_candles={
+            "AUDCAD_otc": [[]],                     # empty -> error lookup applies
+            "USDINR_otc": [["usdinr_candle_1", "usdinr_candle_2"]],  # succeeds immediately
+        },
+        candle_errors={"AUDCAD_otc_60": {
+            "error": "AUDCAD_PROTOCOL_REJECTED", "message": None,
+            "timestamp": time.time(), "kind": "protocol_error",
+        }},
+        # Deliberately NOT present for USDINR_otc_60 — proves it can't
+        # accidentally pick up AUDCAD's error.
+    )
+    f_audcad = QuotexDataFetcherUnderTest(shared_client, asset="AUDCAD_otc")
+    f_usdinr = QuotexDataFetcherUnderTest(shared_client, asset="USDINR_otc")
+
+    audcad_result, usdinr_result = await asyncio.gather(
+        f_audcad.get_candles("AUDCAD_otc", "1m", 100, max_retries=0),
+        f_usdinr.get_candles("USDINR_otc", "1m", 100, max_retries=0),
+    )
+    return audcad_result, f_audcad.last_fetch_diagnostics, usdinr_result, f_usdinr.last_fetch_diagnostics
+
+
+audcad_result, audcad_diag, usdinr_result, usdinr_diag = run(_t_concurrent_requests_no_cross_contamination())
+check("H. AUDCAD_otc (the one with an injected error) returns [] and is classified 'protocol_error'",
+      audcad_result == [] and audcad_diag["failure_category"] == "protocol_error")
+check("H. AUDCAD_otc's error content is its own ('AUDCAD_PROTOCOL_REJECTED')",
+      "AUDCAD_PROTOCOL_REJECTED" in audcad_diag["failure_reason"])
+check("H. USDINR_otc (no injected error) succeeds completely independently",
+      usdinr_result == ["usdinr_candle_1", "usdinr_candle_2"])
+check("H. USDINR_otc's diagnostics show NO error at all — it never received AUDCAD's error",
+      usdinr_diag["failure_category"] is None and usdinr_diag["failure_reason"] is None)
+check("H. USDINR_otc's diagnostics never mention AUDCAD anywhere (no cross-request leakage)",
+      "AUDCAD" not in repr(usdinr_diag))
+check("H. AUDCAD_otc's diagnostics never mention USDINR anywhere either",
+      "USDINR" not in repr(audcad_diag))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n=== I. Successful candle response behavior remains unchanged ===")
+# ═══════════════════════════════════════════════════════════════════════════
+async def _t_success_path_unchanged():
+    fc = FakeAsyncQuotexClient(candle_sequence=[["c1", "c2", "c3", "c4"]],
+                                assets_snapshot={"EURUSD_otc": {}})
+    f = make_fetcher(fc)
+    result = await f.get_candles("EURUSD_otc", "1m", 100)
+    return result, f.last_fetch_diagnostics
+
+
+result, diag = run(_t_success_path_unchanged())
+check("I. success path still returns the exact real candle list, untouched",
+      result == ["c1", "c2", "c3", "c4"])
+check("I. success path still reports failure_category is None (no regression)",
+      diag["failure_category"] is None)
+check("I. success path still reports failure_reason is None (no regression)",
+      diag["failure_reason"] is None)
+check("I. success path still reports retry_attempts == 0 (no regression)",
+      diag["retry_attempts"] == 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n=== J. QUOTEX_SSID never appears in diagnostics/API-response/exceptions/logs ===")
+# ═══════════════════════════════════════════════════════════════════════════
+async def _t_ssid_never_leaks_with_protocol_error():
+    os.environ["QUOTEX_SSID"] = "THIS_IS_A_FAKE_TEST_SSID_VALUE_67890"
+    try:
+        fc = FakeAsyncQuotexClient(
+            candle_sequence=[[]], assets_snapshot={"AUDCAD_otc": {}},
+            candle_errors={"AUDCAD_otc_60": {
+                "error": "some_protocol_error", "message": "rejected",
+                "timestamp": time.time(), "kind": "protocol_error",
+            }},
+        )
+        f = make_fetcher(fc)
+        result = await f.get_candles("AUDCAD_otc", "1m", 100, max_retries=0)
+        diag_str = repr(f.last_fetch_diagnostics)
+        return "THIS_IS_A_FAKE_TEST_SSID_VALUE_67890" not in diag_str and "THIS_IS_A_FAKE_TEST_SSID_VALUE_67890" not in repr(result)
+    finally:
+        del os.environ["QUOTEX_SSID"]
+
+
+check("J. QUOTEX_SSID never appears in diagnostics even when a protocol error is present",
+      run(_t_ssid_never_leaks_with_protocol_error()))
+
+# J (source-level): app.py's new diagnostics-surfacing code never reads/forwards
+# anything named ssid/credential/cookie/token/password/authorization.
+_app_src_check = open(os.path.join(_MARKET_ANALYZER, "webapp", "app.py"), encoding="utf-8").read()
+_diag_block_start = _app_src_check.find("diag = getattr(fetcher, \"last_fetch_diagnostics\"")
+_diag_block = _app_src_check[_diag_block_start:_diag_block_start + 1200] if _diag_block_start != -1 else ""
+check("J (source). app.py's df.empty diagnostics block exists and was found for inspection",
+      _diag_block_start != -1)
+check("J (source). app.py's df.empty diagnostics block never references ssid/cookie/token/"
+      "password/authorization/credential",
+      not any(kw in _diag_block.lower() for kw in
+              ["ssid", "cookie", "token", "password", "authorization", "credential"]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n=== Timeout behavior: late response after timeout doesn't corrupt another request ===")
+# ═══════════════════════════════════════════════════════════════════════════
+async def _t_late_response_does_not_corrupt_other_request():
+    """
+    A request that eventually times out (no error, no data) must not
+    contaminate a DIFFERENT, later/concurrent request's diagnostics —
+    each rid's error-state is independent and consumed exactly once via
+    get_last_candle_error()'s pop() semantics.
+    """
+    shared_client = FakeAsyncQuotexClient(
+        assets_snapshot={"GBPUSD_otc": {}, "NZDUSD_otc": {}},
+        per_asset_candles={
+            "GBPUSD_otc": [[], [], []],           # times out — no error ever recorded
+            "NZDUSD_otc": [["nzdusd_candle"]],     # succeeds cleanly
+        },
+    )
+    f_gbp = QuotexDataFetcherUnderTest(shared_client, asset="GBPUSD_otc")
+    f_nzd = QuotexDataFetcherUnderTest(shared_client, asset="NZDUSD_otc")
+
+    gbp_result = await f_gbp.get_candles("GBPUSD_otc", "1m", 100, max_retries=2)
+    nzd_result = await f_nzd.get_candles("NZDUSD_otc", "1m", 100, max_retries=0)
+    return gbp_result, f_gbp.last_fetch_diagnostics, nzd_result, f_nzd.last_fetch_diagnostics
+
+
+gbp_result, gbp_diag, nzd_result, nzd_diag = run(_t_late_response_does_not_corrupt_other_request())
+check("timeout: the timed-out request (GBPUSD_otc) is classified 'timeout', not fabricated success",
+      gbp_result == [] and gbp_diag["failure_category"] == "timeout")
+check("timeout: a different request on the same shared client (NZDUSD_otc) is completely unaffected",
+      nzd_result == ["nzdusd_candle"] and nzd_diag["failure_category"] is None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

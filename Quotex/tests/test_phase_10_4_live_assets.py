@@ -126,8 +126,12 @@ check("a symbol Quotex never returned at all reports NOT available (never fabric
 print("\n=== 9-10. No candle data / candle fetch failure — distinct from availability, not fabricated ===")
 with open(os.path.join(WEBAPP_DIR, "app.py"), encoding="utf-8") as f:
     app_src = f.read()
-check("candle-empty pipeline path still returns a distinct {'error': ...} dict (unchanged, not touched by this task)",
-      '"error": f"No candles received for {asset} [{timeframe}]' in app_src)
+check("candle-empty pipeline path still returns a distinct {'error': ...} dict — content was "
+      "intentionally updated by the later, approved AUDCAD protocol-error fix (structured "
+      "diagnostics now included), but the same {'error': ..., 'diagnostics': {...}} contract holds",
+      'return {\n                "error": reason,\n                "failure_category": category,\n'
+      '                "diagnostics": diag,\n            }' in app_src
+      or '"error": reason' in app_src)
 check("scanner.py still converts that error dict into a real exception -> FAILED diagnostic (M1, unchanged)",
       'raise RuntimeError(result["error"])' in open(os.path.join(WEBAPP_DIR, "scanner.py"), encoding="utf-8").read())
 
