@@ -74,12 +74,22 @@ class ScannerEngine:
         adx_trending: float,
         config: Optional[ScannerConfig] = None,
         settings_store: Optional[Any] = None,
+        live_data_lock: Optional[Callable[[], "asyncio.Lock"]] = None,
     ) -> None:
         self._run_pipeline = run_pipeline
         self._assets = list(assets)
         self._invalidate_fetcher = invalidate_fetcher
         self._adx_trending = adx_trending
         self.cfg = config or ScannerConfig()
+
+        # Part 3 approved fix — Analyzer priority over Scanner. Optional
+        # getter (mirrors app.py's _get_shared_fetcher()/_fetcher_lock()
+        # lazy-creation pattern) for the lock shared with manual /api/signal
+        # requests, so a Scanner fetch and a manual Analyzer fetch are never
+        # simultaneously in-flight. If None (e.g. an older caller/test that
+        # doesn't pass one), the scanner behaves exactly as it did before
+        # this fix — no lock is used, matching prior behavior exactly.
+        self._live_data_lock_getter = live_data_lock
 
         # Phase 8.1 — SettingsStore integration (fully optional/additive).
         # `settings_store` is duck-typed (anything with a .get() -> dict
@@ -300,6 +310,37 @@ class ScannerEngine:
             waited += step
         self._set_state(prev_state if prev_state != YIELDING else RUNNING)
 
+    async def _acquire_live_data_lock_with_priority(self) -> Optional["asyncio.Lock"]:
+        """
+        Part 3 approved fix. Called immediately before EVERY single
+        _run_pipeline() call the scan loop makes (not just once per asset),
+        closing the gap where a manual request starting mid-fetch could
+        previously overlap with a Scanner fetch on the same shared Quotex
+        session. Always defers to an in-flight manual (Analyzer) request:
+          1. Yields (via _yield_to_manual_requests(), unchanged) while a
+             manual request is currently active.
+          2. Acquires the shared live-data lock.
+          3. Re-checks manual_requests_in_flight immediately after
+             acquiring — closes the race where a manual request starts in
+             the instant between the check in step 1 and the acquire in
+             step 2. If one slipped in, releases and loops back to step 1.
+          4. Returns the acquired, held lock (caller MUST release it in a
+             finally block) once neither race applies.
+        Returns None (no-op) if no lock getter was configured, so the
+        Scanner still runs exactly as before if it's ever constructed
+        without one (e.g. an older test).
+        """
+        if self._live_data_lock_getter is None:
+            return None
+        while True:
+            await self._yield_to_manual_requests()
+            lock = self._live_data_lock_getter()
+            await lock.acquire()
+            if self.manual_requests_in_flight > 0:
+                lock.release()
+                continue
+            return lock
+
     # ── Cache ────────────────────────────────────────────────────────────────
     def _store_result(self, asset: str, timeframe: str, result: Dict[str, Any],
                        duration_seconds: float) -> None:
@@ -388,12 +429,22 @@ class ScannerEngine:
                         if self._stop_requested:
                             break
                         self.current_timeframe = tf  # Phase 8.3 — status-panel field
+                        # Part 3 approved fix — acquire the shared live-data
+                        # lock (with manual-request priority) immediately
+                        # before THIS specific fetch, not just once per
+                        # asset. Ensures this fetch and any manual /api/signal
+                        # request are never simultaneously in-flight.
+                        _live_lock = await self._acquire_live_data_lock_with_priority()
                         t_start = _now()
                         try:
-                            result = await asyncio.wait_for(
-                                self._run_pipeline(asset, tf),
-                                timeout=self.cfg.asset_timeout_seconds,
-                            )
+                            try:
+                                result = await asyncio.wait_for(
+                                    self._run_pipeline(asset, tf),
+                                    timeout=self.cfg.asset_timeout_seconds,
+                                )
+                            finally:
+                                if _live_lock is not None:
+                                    _live_lock.release()
                             duration = _now() - t_start
                             self._asset_durations.append(duration)
 

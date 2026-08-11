@@ -241,6 +241,43 @@ def _fetcher_lock() -> asyncio.Lock:
     return _fetcher_alock
 
 
+# Part 3 approved fix — Analyzer priority over Scanner.
+# Single shared lock serializing the actual live candle-fetch call
+# (_run_pipeline()) across BOTH the Scanner's per-asset/timeframe loop and
+# manual /api/signal requests, so a Scanner fetch and a manual Analyzer
+# fetch are never simultaneously in-flight on the shared Quotex session —
+# closing the gap identified in Part 2 (the Scanner's prior yield-between-
+# assets check didn't cover a manual request starting mid-fetch).
+# Manual requests take priority: api_signal() marks
+# _scanner.manual_request_started() BEFORE attempting to acquire this
+# lock (see api_signal() below), and the Scanner checks that same flag
+# both before AND immediately after acquiring the lock (see scanner.py's
+# _acquire_live_data_lock_with_priority()), backing off if it's set so it
+# never starts a new fetch while a manual request is active or waiting.
+# Created lazily inside the bg loop, same pattern as _fetcher_lock().
+# This does not change _run_pipeline() itself — it only wraps calls to it.
+_live_data_alock: asyncio.Lock | None = None
+
+
+def _live_data_lock() -> asyncio.Lock:
+    global _live_data_alock
+    if _live_data_alock is None:
+        _live_data_alock = asyncio.Lock()
+    return _live_data_alock
+
+
+async def _run_pipeline_with_priority(asset: str, timeframe: str) -> Dict[str, Any]:
+    """
+    Thin wrapper used ONLY by manual /api/signal requests: acquires the
+    shared live-data lock (see _live_data_lock() above) and then calls
+    the existing, unmodified _run_pipeline() exactly as before. Exists
+    so manual requests and the Scanner serialize through the same lock
+    without altering _run_pipeline()'s own logic at all.
+    """
+    async with _live_data_lock():
+        return await _run_pipeline(asset, timeframe)
+
+
 def _fetcher_is_alive() -> bool:
     """Quick probe — no I/O, just check the client flag."""
     f = _shared_fetcher
@@ -653,6 +690,11 @@ _scanner = ScannerEngine(
     adx_trending=cfg.ADX_TRENDING,
     config=ScannerConfig(min_payout=cfg.MIN_PAYOUT),
     settings_store=settings_store,
+    # Part 3 approved fix — Analyzer priority over Scanner. Passing the
+    # lock GETTER (not the lock itself) mirrors _get_shared_fetcher()'s
+    # own lazy-creation pattern, so the Lock is only ever constructed
+    # from inside the running _BG_LOOP, never at import time.
+    live_data_lock=_live_data_lock,
 )
 
 
@@ -865,7 +907,12 @@ def api_signal():
         # (if running) yields between its own asset steps until this finishes.
         _scanner.manual_request_started()
         try:
-            result = _run_bg(_run_pipeline(asset, timeframe))
+            # Part 3 approved fix: goes through _run_pipeline_with_priority()
+            # (shared live-data lock) instead of calling _run_pipeline()
+            # directly, so this manual request and any in-progress/upcoming
+            # Scanner fetch are never simultaneously in-flight. _run_pipeline()
+            # itself is unchanged; only how it's invoked here changed.
+            result = _run_bg(_run_pipeline_with_priority(asset, timeframe))
         finally:
             _scanner.manual_request_finished()
     except FileNotFoundError as e:
@@ -904,23 +951,30 @@ def healthz():
 _LIVE_PRICE_CACHE: dict = {"prices": {}, "ts": 0.0}
 _TOP_OTC = ["EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc", "EURJPY_otc"]
 
-# Phase 3: bounded concurrency for per-asset candle fetches below.
-# AsyncQuotexClient._request_candles() already keys in-flight requests by
-# "{asset}_{timeframe}" (see api_quotex/client.py), so concurrent fetches for
-# different assets on the same connection are safe by the client's own design.
-# The semaphore just caps how many fetches run at once, to stay a well-behaved
-# client of the upstream server rather than firing all assets simultaneously.
+# Phase 3 / Part 3 approved fix: bounded concurrency for per-asset candle
+# fetches below. AsyncQuotexClient._request_candles() keys in-flight
+# requests by "{asset}_{timeframe}", and _on_candles_received() (Part 3
+# fix) now ONLY ever resolves a request from a response exactly matching
+# its own (asset, period) — never from an unrelated pending request — so
+# concurrent fetches for different assets on the same connection are safe.
+# The semaphore just caps how many fetches run at once, to stay a
+# well-behaved client of the upstream server rather than firing all assets
+# simultaneously.
 _LIVE_PRICES_MAX_CONCURRENCY = 5
 
 
 async def _fetch_current_prices(assets: list) -> dict:
     """
-    Connect once, pull the latest 1-minute candle for each asset concurrently
-    (bounded by a semaphore), disconnect.
-    Returns { asset_sym: { price: float, change_pct: float } }.
-    NEVER places orders — read-only candle data only.
+    Pull the latest 1-minute candle for each asset concurrently (bounded by
+    a semaphore), using the existing persistent shared fetcher/session
+    (Part 3 approved fix) instead of opening a second, independent Quotex
+    connection. Returns { asset_sym: { price: float, change_pct: float } }.
+    NEVER places orders — read-only candle data only. Never connects or
+    disconnects the shared fetcher itself — that lifecycle belongs solely
+    to _get_shared_fetcher()/_invalidate_shared_fetcher(); this function
+    only borrows the existing connection.
     """
-    fetcher = QuotexDataFetcher()
+    fetcher = await _get_shared_fetcher()
     result: dict = {}
     semaphore = asyncio.Semaphore(_LIVE_PRICES_MAX_CONCURRENCY)
 
@@ -936,11 +990,7 @@ async def _fetch_current_prices(assets: list) -> dict:
             except Exception:
                 pass  # Skip individual asset errors — each asset writes to its own key
 
-    try:
-        await fetcher.connect()
-        await asyncio.gather(*(_fetch_one(a) for a in assets))
-    finally:
-        await fetcher.disconnect()
+    await asyncio.gather(*(_fetch_one(a) for a in assets))
     return result
 
 
@@ -1908,7 +1958,9 @@ def api_ai_explain():
         try:
             _scanner.manual_request_started()
             try:
-                result = _run_bg(_run_pipeline(asset, timeframe))
+                # Part 3 approved fix — same priority-lock wrapper as
+                # /api/signal (see _run_pipeline_with_priority() above).
+                result = _run_bg(_run_pipeline_with_priority(asset, timeframe))
             finally:
                 _scanner.manual_request_finished()
         except FileNotFoundError as e:

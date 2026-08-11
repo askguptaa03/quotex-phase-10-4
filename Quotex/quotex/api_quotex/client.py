@@ -128,6 +128,11 @@ class AsyncQuotexClient:
         # belongs to (see _on_error() and get_last_candle_error() below).
         self._candle_request_errors: Dict[str, Dict[str, Any]] = {}
         self._recent_uncorrelated_candle_errors: List[Dict[str, Any]] = []
+        # Part 3 approved fix — candle responses that could not be safely
+        # correlated to any currently-pending request (see
+        # _on_candles_received() / _record_unmatched_candle_response()).
+        # Diagnostics only; never used to resolve a request.
+        self._unmatched_candle_responses: List[Dict[str, Any]] = []
         self._balance_requests: Dict[str, asyncio.Future] = {}
         self._payout_data: Dict[str, float] = {}
         self._server_time: Optional[ServerTime] = None
@@ -1114,11 +1119,52 @@ class AsyncQuotexClient:
             # Let _on_candles_received own completion; just cleanup mapping here
             self._candle_requests.pop(request_id, None)
 
+    def _record_unmatched_candle_response(self, asset: Optional[str], period: Optional[int],
+                                          reason: str) -> None:
+        """
+        Part 3 approved fix. A candle response that cannot be safely
+        correlated to a currently-pending request is recorded here for
+        diagnostics ONLY. It is never used to resolve or short-circuit
+        any pending future and is never merged into any asset's cache —
+        see _on_candles_received() for the enforcement of that rule.
+        Bounded to the most recent 50 entries to avoid unbounded growth.
+        """
+        self._unmatched_candle_responses.append({
+            "asset": asset, "period": period, "reason": reason, "timestamp": time.time(),
+        })
+        if len(self._unmatched_candle_responses) > 50:
+            self._unmatched_candle_responses = self._unmatched_candle_responses[-50:]
+
+    def get_recent_unmatched_candle_responses(self, since_ts: float) -> List[Dict[str, Any]]:
+        """
+        Diagnostics-only accessor (Part 3 approved fix), symmetric with
+        get_recent_uncorrelated_candle_errors(). Returns candle responses
+        that arrived but could not be safely correlated to any pending
+        request — e.g. a late response for an already-timed-out request,
+        or a response missing asset/period entirely. Never used to
+        resolve any request; informational only.
+        """
+        return [e for e in self._unmatched_candle_responses if e.get("timestamp", 0) >= since_ts]
+
     async def _on_candles_received(self, data: Dict[str, Any]) -> None:
         """
         Handles both history/list/v2 & chart_notification/get payloads.
-        - Resolves the matching pending future immediately (first packet wins).
-        - Merges into FastCandleStore for instant subsequent reads.
+
+        Correlation rule (Part 3 approved fix): a response is ONLY ever
+        applied to the pending request whose (asset, period) it exactly
+        matches, and is ONLY ever merged into that same (asset, period)
+        FastCandleStore entry. A response that cannot be exactly
+        correlated to a currently-pending request — asset/period missing,
+        or naming an asset/period nothing is currently waiting on (e.g. a
+        late response arriving after its own request already timed out
+        and was removed from _candle_requests) — is NEVER assigned to a
+        different pending request and NEVER written into a different
+        asset's cache. It is recorded via _record_unmatched_candle_
+        response() for diagnostics only. Any other still-pending request
+        is left untouched to resolve via its own normal timeout/retry
+        path in _request_candles(). This intentionally replaces the
+        previous "resolve the first pending future" fallback, which could
+        misassign one asset's candles to a different asset's request.
         """
         try:
             asset = data.get("asset") if isinstance(data, dict) else None
@@ -1129,38 +1175,42 @@ class AsyncQuotexClient:
                     candles_raw = data["candles"]
                 elif "history" in data and isinstance(data["history"], list):
                     candles_raw = data["history"]
-            parsed: List["Candle"] = []
-            if (asset is not None) and (period is not None):
-                parsed = self._parse_candles_data(candles_raw, asset, int(period))
-                # Merge into fast store
-                if parsed:
-                    if not hasattr(self, "_fast_store"):
-                        self._fast_store = FastCandleStore()
-                    self._fast_store.add_many(asset, int(period), parsed)
-            rid = f"{asset}_{int(period)}"
+
+            if asset is None or period is None:
+                # Cannot safely correlate this response to any specific
+                # request — never guess which pending future it belongs
+                # to. Record as unmatched and stop.
+                self._record_unmatched_candle_response(asset, period, reason="missing_asset_or_period")
+                return
+
+            period_int = int(period)
+            parsed = self._parse_candles_data(candles_raw, asset, period_int)
+            # Merge into fast store ONLY under the response's own, exactly
+            # stated (asset, period) — never under another asset's key.
+            if parsed:
+                if not hasattr(self, "_fast_store"):
+                    self._fast_store = FastCandleStore()
+                self._fast_store.add_many(asset, period_int, parsed)
+
+            rid = f"{asset}_{period_int}"
             waiter = self._candle_requests.get(rid)
             if waiter and not waiter.done():
                 waiter.set_result(parsed)
             else:
-                # Fallback: try resolve the first pending future (rare servers omit asset/period)
-                for rid, fut in list(self._candle_requests.items()):
-                    if fut.done():
-                        continue
-                    parts = rid.split("_")
-                    if len(parts) >= 2:
-                        req_asset = "_".join(parts[:-1])
-                        req_period = int(parts[-1])
-                        parsed = self._parse_candles_data(candles_raw, req_asset, req_period)
-                        if parsed:
-                            if not hasattr(self, "_fast_store"):
-                                self._fast_store = FastCandleStore()
-                            self._fast_store.add_many(req_asset, req_period, parsed)
-                        fut.set_result(parsed)
-                        break
+                # No pending request is currently waiting on this exact
+                # (asset, period) — e.g. a late response for a request
+                # that already timed out. Do NOT resolve any other
+                # pending future with it; record as unmatched/orphan for
+                # diagnostics and let any other pending request continue
+                # toward its own timeout/retry untouched.
+                self._record_unmatched_candle_response(asset, period_int, reason="no_matching_pending_request")
         except Exception as e:
             if self.enable_logging:
                 logger.error(f"Error in candles handler: {e}")
-            # Fail-safe: release all waiters to avoid deadlocks
+            # Fail-safe: release all waiters to avoid deadlocks. This still
+            # only ever resolves each waiter with an EMPTY result — never
+            # with another asset's data — so no cross-asset contamination
+            # is possible even on this exception path.
             for _, fut in list(self._candle_requests.items()):
                 if not fut.done():
                     fut.set_result([])

@@ -329,7 +329,12 @@ check("app.py defines the _build_ai_health() helper", "def _build_ai_health()" i
 for route in ("/api/ai/health", "/api/ai/status", "/api/ai/statistics", "/api/ai/explain"):
     check(f"app.py registers route {route}", f'"{route}"' in _app_src)
 check("app.py's /api/ai/explain reuses _run_pipeline() exactly like /api/signal (same call)",
-      _app_src.count("_run_bg(_run_pipeline(asset, timeframe))") >= 2)
+      # Part 3 approved fix: both routes now go through
+      # _run_pipeline_with_priority() (the shared live-data-lock wrapper
+      # around the still-unmodified _run_pipeline()) instead of calling
+      # _run_pipeline() directly — updated literal, same intent: both
+      # routes must invoke the pipeline the exact same way.
+      _app_src.count("_run_bg(_run_pipeline_with_priority(asset, timeframe))") >= 2)
 check("app.py's /api/ai/explain falls back to the scanner's top-ranked cached signal when no asset is given",
       "top_signals = _scanner.get_results().get(\"top_signals\") or []" in _app_src
       and "result = top_signals[0] if top_signals else {}" in _app_src)
