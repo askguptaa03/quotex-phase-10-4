@@ -982,6 +982,10 @@ def api_diagnostic():
                 "asset": asset, "timeframe": timeframe, "count": count
             })
 
+            # Capture transport metadata around this exact request.
+            transport_started_at = time.time()
+            transport_before = fetcher.get_candle_transport_diagnostics()
+
             try:
                 df = await fetcher.get_candles_df(
                     asset=asset, timeframe=timeframe, count=count
@@ -999,6 +1003,40 @@ def api_diagnostic():
 
             diag = dict(getattr(fetcher, "last_fetch_diagnostics", {}) or {})
             rows = int(len(df)) if df is not None else 0
+
+            transport_after = fetcher.get_candle_transport_diagnostics()
+            trace = list(transport_after.get("recent_trace") or [])
+            transport_events = [
+                e for e in trace
+                if isinstance(e, dict) and float(e.get("ts", 0) or 0) >= transport_started_at - 0.25
+            ]
+            unmatched = fetcher.get_recent_unmatched_candle_responses(transport_started_at - 0.25)
+            uncorrelated = fetcher.get_recent_uncorrelated_candle_errors(transport_started_at - 0.25)
+            sent = [e for e in transport_events if e.get("direction") == "send"]
+            received = [e for e in transport_events if e.get("direction") == "recv"]
+            history_received = [e for e in received if e.get("event") in (
+                "history/list", "history/list/v2", "chart_notification/get", "loadHistoryPeriod", "candles_received"
+            )]
+            transport = {
+                "events": transport_events[-50:],
+                "event_count": len(transport_events),
+                "pending_binary_events_before": transport_before.get("pending_binary_events", []),
+                "pending_binary_events_after": transport_after.get("pending_binary_events", []),
+                "unmatched_candle_responses": unmatched[-20:],
+                "uncorrelated_candle_errors": uncorrelated[-20:],
+                "interpretation": {
+                    "request_send_events": len(sent),
+                    "receive_events": len(received),
+                    "history_or_candle_events": len(history_received),
+                    "server_frame_observed": bool(received),
+                    "history_frame_observed": bool(history_received),
+                    "parser_or_correlation_issue_suspected": bool(history_received) and rows == 0,
+                    "transport_no_response_suspected": not received and rows == 0,
+                    "unmatched_response_observed": bool(unmatched),
+                },
+            }
+            diag["transport"] = transport
+            add_stage("transport_diagnostic", "ok", transport)
 
             if rows:
                 add_stage("candle_fetch", "ok", {
