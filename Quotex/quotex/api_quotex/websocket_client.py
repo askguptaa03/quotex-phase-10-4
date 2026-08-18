@@ -150,8 +150,15 @@ class AsyncWebSocketClient:
         self.ssl_mutual_exclusion: bool = False
         self.ssl_mutual_exclusion_write: bool = False
         self._last_auth_error: Optional[Dict] = None
-        # Pending event from '451-["event",{"_placeholder":true}]'
+        # Engine.IO 451- frames announce a following binary JSON payload.
+        # Keep a FIFO queue rather than a single slot: multiple 451 headers can
+        # arrive before their binary payloads, and a single mutable slot can
+        # overwrite the candle-history event and cause a silent timeout.
+        self._pending_binary_events: deque[str] = deque(maxlen=50)
+        # Backward-compatible diagnostic mirror of the next queued event.
         self._pending_binary_event: Optional[str] = None
+        # Bounded, secret-free transport trace exposed to diagnostics.
+        self._candle_transport_trace: deque[Dict[str, Any]] = deque(maxlen=100)
 
     @property
     def is_connected(self) -> bool:
@@ -571,7 +578,11 @@ class AsyncWebSocketClient:
                     decoded_message = message.decode("utf-8")
                     logger.debug(f"Received binary message: {decoded_message[:100]}...")
                     if decoded_message.startswith('\x04'):
-                        logger.warning(f"[CANDLE-DEBUG] WS binary frame len={len(decoded_message)} pending_event={self._pending_binary_event} prefix={decoded_message[:120]!r}")
+                        logger.warning(
+                            f"[CANDLE-DEBUG] WS binary frame len={len(decoded_message)} "
+                            f"pending_events={list(self._pending_binary_events)[:10]} "
+                            f"prefix={decoded_message[:120]!r}"
+                        )
                         # Delegate to binary handler that understands pending 451- header
                         await self._handle_candle_message(decoded_message)
                     else:
@@ -700,8 +711,19 @@ class AsyncWebSocketClient:
         try:
             head = message.split('451-[')[1]
             event_name = head.split('"')[1]  # e.g. s_orders/open
-            self._pending_binary_event = event_name
-            logger.debug(f"Pending binary event set to: {self._pending_binary_event}")
+            self._pending_binary_events.append(event_name)
+            self._pending_binary_event = self._pending_binary_events[0]
+            self._candle_transport_trace.append({
+                "ts": time.time(),
+                "direction": "recv",
+                "frame": "451-header",
+                "event": event_name,
+                "pending_depth": len(self._pending_binary_events),
+            })
+            logger.debug(
+                f"Pending binary event queued: {event_name} "
+                f"(depth={len(self._pending_binary_events)})"
+            )
         except Exception as e:
             logger.error(f"Failed to parse 451- header: {e}")
             await error_monitor.record_error(
@@ -748,6 +770,14 @@ class AsyncWebSocketClient:
                 return
 
             if event in ("history/list", "history/list/v2", "chart_notification/get", "loadHistoryPeriod"):
+                self._candle_transport_trace.append({
+                    "ts": time.time(),
+                    "direction": "recv",
+                    "frame": "socketio-text",
+                    "event": event,
+                    "payload_type": type(body).__name__,
+                    "payload_count": len(body) if isinstance(body, (list, dict)) else None,
+                })
                 # Quotex has used multiple history event names over time.
                 # Normalize all known candle-history responses into the same
                 # candles_received callback so the API client can correlate
@@ -850,84 +880,12 @@ class AsyncWebSocketClient:
             pass
         return "json_data"
 
-    async def _handle_candle_message(self, message: str) -> None:
-        """
-        Handles Engine.IO binary frame decoded as str that starts with '\x04'.
-        After '\x04' is pure JSON (object or array).
-        Supports:
-          - headered flow: 451-["<event>",...]  then \x04{...}
-          - headerless flow: directly \x04[...] or \x04{...}
-        """
-        try:
-            if not message.startswith("\x04"):
-                return
-
-            payload = json.loads(message[1:])  # strip \x04
-
-            # No pending header (headerless push)
-            if not self._pending_binary_event:
-                inferred = self._event_headerless_payload(payload)
-                logger.debug(f"Headerless \\x04 payload inferred as: {inferred}")
-                await self._emit_event(inferred, payload)
-                return
-
-            # We have a header stored from 451-[...]
-            event_name = self._pending_binary_event
-            self._pending_binary_event = None  # reset
-
-            logger.debug(f"Dispatching payload for {event_name}")
-
-            if event_name == "s_balance":
-                await self._emit_event("balance_data", payload)
-
-            elif event_name == "s_orders/open":
-                await self._emit_event("order_opened", payload)
-
-            elif event_name == "s_orders/close":
-                deals = (payload or {}).get("deals") or []
-                if isinstance(deals, list):
-                    for d in deals:
-                        await self._emit_event("order_closed", d)
-                else:
-                    ticket = (payload or {}).get("ticket")
-                    if isinstance(ticket, dict):
-                        await self._emit_event("order_closed", ticket)
-
-            elif event_name == "orders/closed/list":
-                # Emit as a dedicated event (not json_data) to match client handler
-                await self._emit_event("orders_closed_list", payload if isinstance(payload, list) else [])
-
-            elif event_name == "instruments/list":
-                await self._emit_event("assets_list", payload)
-
-            elif event_name == "quotes/stream":
-                await self._emit_event("quote_stream", payload)
-
-            elif event_name in ("history/list", "history/list/v2", "chart_notification/get", "loadHistoryPeriod"):
-                await self._emit_event("candles_received", payload)
-
-            else:
-                await self._emit_event("json_data", {"event": event_name, "data": payload})
-
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error for binary payload: {e}")
-            await error_monitor.record_error(
-                error_type="binary_json_decode_error",
-                severity=ErrorSeverity.MEDIUM,
-                category=ErrorCategory.DATA,
-                message=f"JSON decode error for binary payload: {str(e)}",
-                context={}
-            )
-
-        except Exception as e:
-            logger.error(f"Error handling binary payload: {e}")
-            await error_monitor.record_error(
-                error_type="binary_payload_error",
-                severity=ErrorSeverity.HIGH,
-                category=ErrorCategory.DATA,
-                message=f"Error handling binary payload: {str(e)}",
-                context={}
-            )
+    def get_candle_transport_diagnostics(self) -> Dict[str, Any]:
+        """Return bounded, secret-free candle transport diagnostics."""
+        return {
+            "pending_binary_events": list(self._pending_binary_events),
+            "recent_trace": list(self._candle_transport_trace)[-30:],
+        }
 
     async def _handle_candle_message(self, message: str) -> None:
         """
@@ -947,17 +905,39 @@ class AsyncWebSocketClient:
                 logger.warning(f"[CANDLE-DEBUG] WS payload list len={len(payload)} first_type={type(payload[0]).__name__ if payload else 'empty'}")
             else:
                 logger.warning(f"[CANDLE-DEBUG] WS payload type={type(payload).__name__}")
-            # If no pending header, infer and dispatch quickly (Pocket Option-like)
-            if not self._pending_binary_event:
+            # If no pending header, infer and dispatch from payload shape.
+            if not self._pending_binary_events:
                 inferred = self._event_headerless_payload(payload)
                 logger.warning(f"[CANDLE-DEBUG] WS headerless inferred_event={inferred}")
-                # Direct emit with no extra allocations/log noise
+                self._candle_transport_trace.append({
+                    "ts": time.time(),
+                    "direction": "recv",
+                    "frame": "binary-headerless",
+                    "event": inferred,
+                    "payload_type": type(payload).__name__,
+                    "payload_count": len(payload) if isinstance(payload, (list, dict)) else None,
+                })
                 await self._emit_event(inferred, payload)
                 return
-            # We have a pending 451 header → route deterministically
-            event_name = self._pending_binary_event
-            self._pending_binary_event = None
-            logger.warning(f"[CANDLE-DEBUG] WS binary event_name={event_name}")
+
+            # Consume exactly one queued 451 header for this binary payload.
+            event_name = self._pending_binary_events.popleft()
+            self._pending_binary_event = (
+                self._pending_binary_events[0]
+                if self._pending_binary_events else None
+            )
+            logger.warning(
+                f"[CANDLE-DEBUG] WS binary event_name={event_name} "
+                f"remaining={len(self._pending_binary_events)}"
+            )
+            self._candle_transport_trace.append({
+                "ts": time.time(),
+                "direction": "recv",
+                "frame": "binary-payload",
+                "event": event_name,
+                "payload_type": type(payload).__name__,
+                "payload_count": len(payload) if isinstance(payload, (list, dict)) else None,
+            })
             if event_name == "s_balance":
                 await self._emit_event("balance_data", payload)
             elif event_name == "s_orders/open":
