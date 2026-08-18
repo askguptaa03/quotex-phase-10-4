@@ -820,7 +820,7 @@ class AsyncWebSocketClient:
                 if isinstance(first, list) and len(first) >= 3 and isinstance(first[0], str) and isinstance(first[1], (int, float)):
                     return "quote_stream"
             if isinstance(payload, dict):
-                if all(k in payload for k in ("asset", "period", "history")):
+                if all(k in payload for k in ("asset", "period")) and ("history" in payload or "candles" in payload):
                     return "candles_received"
                 if "uid" in payload and "balance" in payload:
                     return "balance_data"
@@ -881,7 +881,7 @@ class AsyncWebSocketClient:
             elif event_name == "quotes/stream":
                 await self._emit_event("quote_stream", payload)
 
-            elif event_name == "history/list/v2":
+            elif event_name in ("history/list", "history/list/v2", "chart_notification/get", "loadHistoryPeriod"):
                 await self._emit_event("candles_received", payload)
 
             else:
@@ -947,9 +947,7 @@ class AsyncWebSocketClient:
                 await self._emit_event("assets_list", payload)
             elif event_name == "quotes/stream":
                 await self._emit_event("quote_stream", payload)
-            elif event_name == "history/list/v2":
-                await self._emit_event("candles_received", payload)
-            elif event_name == "chart_notification/get":
+            elif event_name in ("history/list", "history/list/v2", "chart_notification/get", "loadHistoryPeriod"):
                 await self._emit_event("candles_received", payload)
             else:
                 await self._emit_event("json_data", {"event": event_name, "data": payload})
