@@ -1167,14 +1167,28 @@ class AsyncQuotexClient:
         misassign one asset's candles to a different asset's request.
         """
         try:
-            asset = data.get("asset") if isinstance(data, dict) else None
-            period = data.get("period") if isinstance(data, dict) else None
+            # Quotex has emitted candle-history payloads in a few shapes:
+            # {"asset","period","history":[...]},
+            # {"asset","period","candles":[...]}, and, on some routes,
+            # a nested {"data": {...}} wrapper. Normalize those shapes here
+            # without weakening the strict asset/period correlation rule.
+            payload: Any = data
+            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                nested = payload.get("data")
+                if any(k in nested for k in ("asset", "period", "history", "candles")):
+                    payload = nested
+
+            asset = payload.get("asset") if isinstance(payload, dict) else None
+            period = payload.get("period") if isinstance(payload, dict) else None
             candles_raw: List[Any] = []
-            if isinstance(data, dict):
-                if "candles" in data and isinstance(data["candles"], list):
-                    candles_raw = data["candles"]
-                elif "history" in data and isinstance(data["history"], list):
-                    candles_raw = data["history"]
+            if isinstance(payload, dict):
+                if "candles" in payload and isinstance(payload["candles"], list):
+                    candles_raw = payload["candles"]
+                elif "history" in payload and isinstance(payload["history"], list):
+                    candles_raw = payload["history"]
+                elif "history" in payload and isinstance(payload["history"], dict):
+                    # Some responses use timestamp keys for history rows.
+                    candles_raw = list(payload["history"].values())
 
             if asset is None or period is None:
                 # Cannot safely correlate this response to any specific
@@ -1226,19 +1240,41 @@ class AsyncQuotexClient:
         try:
             if isinstance(candles_data, list):
                 for row in candles_data:
-                    if not (isinstance(row, (list, tuple)) and len(row) >= 5):
+                    # Standard Quotex history rows are arrays. Accept the
+                    # equivalent dict form as well because some gateways
+                    # serialize OHLCV rows as named fields.
+                    if isinstance(row, dict):
+                        ts = row.get("timestamp", row.get("time", row.get("at")))
+                        o = row.get("open", row.get("o"))
+                        raw_low = row.get("low", row.get("l"))
+                        raw_high = row.get("high", row.get("h"))
+                        c = row.get("close", row.get("c"))
+                        vol = row.get("volume", row.get("v", 0.0))
+                        if any(v is None for v in (ts, o, raw_low, raw_high, c)):
+                            continue
+                    elif isinstance(row, (list, tuple)) and len(row) >= 5:
+                        ts = row[0]
+                        o = row[1]
+                        raw_low = row[2]
+                        raw_high = row[3]
+                        c = row[4]
+                        vol = row[5] if len(row) > 5 and row[5] is not None else 0.0
+                    else:
                         continue
                     try:
-                        ts = float(row[0])  # seconds
-                        o = float(row[1])
-                        raw_low = float(row[2])
-                        raw_high = float(row[3])
-                        c = float(row[4])
-                        vol = float(row[5]) if len(row) > 5 and row[5] is not None else 0.0
+                        ts = float(ts)
+                        # Accept both Unix seconds and Unix milliseconds.
+                        if ts > 2_000_000_000:
+                            ts /= 1000.0
+                        o = float(o)
+                        raw_low = float(raw_low)
+                        raw_high = float(raw_high)
+                        c = float(c)
+                        vol = float(vol) if vol is not None else 0.0
                         hi = max(raw_high, raw_low)
                         lo = min(raw_high, raw_low)
                         candle = Candle(
-                            timestamp=datetime.fromtimestamp(ts if ts > 2_000_000_000 else int(ts)),
+                            timestamp=datetime.fromtimestamp(ts),
                             open=o, high=hi, low=lo, close=c, volume=vol,
                             asset=asset, timeframe=int(timeframe)
                         )
@@ -1805,7 +1841,7 @@ class AsyncQuotexClient:
                         await self._on_quote_stream(event_data)
                         return
 
-                    if event_type == "history/list/v2":
+                    if event_type in ("history/list", "history/list/v2", "loadHistoryPeriod"):
                         await self._on_candles_received(event_data)
                         return
 
@@ -1858,7 +1894,7 @@ class AsyncQuotexClient:
                     await self._on_quote_stream(event_data)
                     return
 
-                if event_type == "history/list/v2":
+                if event_type in ("history/list", "history/list/v2", "loadHistoryPeriod"):
                     await self._on_candles_received(event_data)
                     return
 

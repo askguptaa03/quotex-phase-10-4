@@ -745,7 +745,11 @@ class AsyncWebSocketClient:
                 await self._emit_event("quote_stream", body)
                 return
 
-            if event in ("history/list/v2", "chart_notification/get", "loadHistoryPeriod"):
+            if event in ("history/list", "history/list/v2", "chart_notification/get", "loadHistoryPeriod"):
+                # Quotex has used multiple history event names over time.
+                # Normalize all known candle-history responses into the same
+                # candles_received callback so the API client can correlate
+                # them with the pending (asset, period) request.
                 await self._emit_event("candles_received", body)
                 return
 
