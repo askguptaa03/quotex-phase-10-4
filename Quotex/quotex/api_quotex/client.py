@@ -1100,11 +1100,25 @@ class AsyncQuotexClient:
             upd_msg = f'42["instruments/update",{{"asset":"{asset}","period":{int(timeframe)}}}]'
             if self.enable_logging:
                 logger.warning(f"[CANDLE-DEBUG] SEND update asset={asset} period={timeframe}")
+            try:
+                self._websocket.record_candle_transport_event(
+                    "socketio-text", event="instruments/update", direction="send",
+                    asset=asset, period=int(timeframe), request_id=request_id, status="sent"
+                )
+            except Exception:
+                pass
             if self._is_persistent and self._keep_alive_manager:
                 await self._keep_alive_manager.send_message(upd_msg)
             else:
                 await self._websocket.send_message(upd_msg)
 
+            try:
+                self._websocket.record_candle_transport_event(
+                    "socketio-text", event="chart_notification/get", direction="send",
+                    asset=asset, period=int(timeframe), request_id=request_id, status="sent"
+                )
+            except Exception:
+                pass
             await self.request_chart_notifications(asset)
             if self.enable_logging:
                 logger.warning(f"[CANDLE-DEBUG] SEND chart_notification asset={asset}")
@@ -1114,6 +1128,14 @@ class AsyncQuotexClient:
             candles = await asyncio.wait_for(candle_future, timeout=timeout)
             if self.enable_logging:
                 logger.warning(f"[CANDLE-DEBUG] FUTURE resolved asset={asset} period={timeframe} candles={len(candles) if isinstance(candles, list) else type(candles).__name__}")
+            try:
+                self._websocket.record_candle_transport_event(
+                    "candle-future", event="candles_received", direction="internal",
+                    asset=asset, period=int(timeframe), request_id=request_id,
+                    payload_count=len(candles) if isinstance(candles, list) else None, status="resolved"
+                )
+            except Exception:
+                pass
             if not candles:
                 # Minimal extension of the same approved error-propagation
                 # mechanism: record that this request resolved successfully
@@ -1129,6 +1151,13 @@ class AsyncQuotexClient:
             if self.enable_logging:
                 logger.warning(f"[CANDLE-DEBUG] TIMEOUT asset={asset} period={timeframe}")
                 logger.warning(f"Candle request timed out for {asset} / {timeframe}")
+            try:
+                self._websocket.record_candle_transport_event(
+                    "candle-future", event="candles_received", direction="internal",
+                    asset=asset, period=int(timeframe), request_id=request_id, status="timeout"
+                )
+            except Exception:
+                pass
             self._candle_request_errors.setdefault(request_id, {
                 "error": None, "message": "timeout: no response received", "timestamp": time.time(), "kind": "timeout",
             })
