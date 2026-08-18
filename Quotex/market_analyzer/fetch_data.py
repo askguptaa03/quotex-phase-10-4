@@ -118,7 +118,7 @@ class QuotexDataFetcher:
         self._client = AsyncQuotexClient(
             ssid=ssid,
             is_demo=self.is_demo,
-            enable_logging=False,   # suppress library logs; we print our own
+            enable_logging=True,    # enable existing library candle diagnostics; secrets are not logged
         )
         print("  → Connecting to Quotex WebSocket …")
         connected = await self._client.connect()
