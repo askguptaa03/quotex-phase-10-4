@@ -19,6 +19,7 @@ import asyncio
 import threading
 import time
 import calendar
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -940,6 +941,107 @@ def api_signal():
         return jsonify(result), 502
     return jsonify(result)
 
+
+
+@app.route("/api/diagnostic", methods=["GET"])
+def api_diagnostic():
+    """Read-only backend candle diagnostic. Never places trades."""
+    asset = (request.args.get("asset") or getattr(cfg, "DEFAULT_ASSET", "EURUSD_otc")).strip()
+    timeframe = (request.args.get("timeframe") or getattr(cfg, "PRIMARY_TIMEFRAME", "1m")).strip()
+    try:
+        count = int(request.args.get("count") or getattr(cfg, "CANDLE_COUNT", 50))
+    except (TypeError, ValueError):
+        count = getattr(cfg, "CANDLE_COUNT", 50)
+    count = max(1, min(count, 500))
+
+    started = time.time()
+    stages = []
+
+    def add_stage(name, status="ok", detail=None):
+        item = {"stage": name, "status": status}
+        if detail is not None:
+            item["detail"] = detail
+        stages.append(item)
+        print(f"[DIAGNOSTIC] {name} status={status}"
+              + (f" detail={detail}" if detail is not None else ""), flush=True)
+
+    async def diagnose():
+        add_stage("request_received", detail={
+            "asset": asset, "timeframe": timeframe, "count": count
+        })
+
+        try:
+            fetcher = await _get_shared_fetcher()
+            connected = _fetcher_is_alive()
+            add_stage("quotex_connection", "ok" if connected else "error", {
+                "connected": connected,
+                "session": "available" if fetcher is not None else "missing",
+            })
+
+            add_stage("candle_fetch_started", detail={
+                "asset": asset, "timeframe": timeframe, "count": count
+            })
+
+            try:
+                df = await fetcher.get_candles_df(
+                    asset=asset, timeframe=timeframe, count=count
+                )
+            except Exception as exc:
+                add_stage("candle_fetch", "error", {
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                    "fetch_diagnostics": dict(
+                        getattr(fetcher, "last_fetch_diagnostics", {}) or {}
+                    ),
+                    "traceback": traceback.format_exc(limit=12),
+                })
+                return
+
+            diag = dict(getattr(fetcher, "last_fetch_diagnostics", {}) or {})
+            rows = int(len(df)) if df is not None else 0
+
+            if rows:
+                add_stage("candle_fetch", "ok", {
+                    "rows": rows,
+                    "diagnostics": diag,
+                    "columns": list(df.columns),
+                })
+                add_stage("analysis", "ready", {
+                    "rows": rows,
+                    "message": "Candles reached the analysis stage."
+                })
+            else:
+                add_stage("candle_fetch", "empty", {
+                    "rows": 0, "diagnostics": diag
+                })
+                add_stage("analysis", "skipped",
+                          "No candles received; indicators were not run.")
+
+        except Exception as exc:
+            add_stage("diagnostic_exception", "error", {
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(limit=12),
+            })
+
+    try:
+        _run_bg(diagnose(), timeout=125.0)
+    except Exception as exc:
+        add_stage("request_runner", "error", {
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(limit=12),
+        })
+
+    return jsonify({
+        "ok": not any(s.get("status") == "error" for s in stages),
+        "read_only": True,
+        "asset": asset,
+        "timeframe": timeframe,
+        "elapsed_seconds": round(time.time() - started, 3),
+        "stages": stages,
+        "note": "Diagnostic only. No order/trade action is performed.",
+    })
 
 @app.route("/healthz")
 def healthz():
