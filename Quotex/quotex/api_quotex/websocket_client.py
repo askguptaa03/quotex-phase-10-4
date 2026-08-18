@@ -880,11 +880,30 @@ class AsyncWebSocketClient:
             pass
         return "json_data"
 
+    def record_candle_transport_event(self, frame: str, event: Optional[str] = None,
+                                      direction: str = "internal", **detail: Any) -> None:
+        """Record bounded, secret-free transport metadata for diagnostics only."""
+        try:
+            item: Dict[str, Any] = {"ts": time.time(), "direction": direction, "frame": frame}
+            if event is not None:
+                item["event"] = str(event)[:120]
+            for key in ("asset", "period", "count", "payload_type", "payload_count",
+                        "pending_depth", "request_id", "status", "error_type"):
+                if key in detail and detail[key] is not None:
+                    value = detail[key]
+                    item[key] = value[:120] if isinstance(value, str) else value
+            self._candle_transport_trace.append(item)
+        except Exception:
+            pass
+
     def get_candle_transport_diagnostics(self) -> Dict[str, Any]:
-        """Return bounded, secret-free candle transport diagnostics."""
+        """Return bounded, secret-free WebSocket transport diagnostics."""
+        trace = list(self._candle_transport_trace)[-50:]
         return {
             "pending_binary_events": list(self._pending_binary_events),
-            "recent_trace": list(self._candle_transport_trace)[-30:],
+            "recent_trace": trace,
+            "trace_count": len(trace),
+            "last_event": trace[-1] if trace else None,
         }
 
     async def _handle_candle_message(self, message: str) -> None:
