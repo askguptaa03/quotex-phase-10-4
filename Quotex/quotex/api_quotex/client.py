@@ -976,19 +976,23 @@ class AsyncQuotexClient:
     # region Candle Management
     async def request_chart_notifications(self, asset: str, version: str = "1.0.0") -> None:
         """
-        Idempotent request of chart notifications (server pushes live/history deltas).
-        Safe to call multiple times; extremely cheap and improves first-plot latency.
+        Send the chart-notification command through the active websocket.
+
+        The command itself has no payload; instruments/update selects the
+        asset/period.  We deliberately use the client's active websocket
+        object rather than the persistent keep-alive wrapper so the command
+        and the receiver share exactly the same transport and diagnostics.
         """
+        msg = '42["chart_notification/get"]'
         try:
-            # Quotex chart notification is a Socket.IO command without a
-            # payload. The asset/timeframe is selected by instruments/update.
-            # Sending a payload here is accepted by some gateways but ignored
-            # by others, which can leave the history response silent.
-            msg = '42["chart_notification/get"]'
-            if self._is_persistent and self._keep_alive_manager:
-                await self._keep_alive_manager.send_message(msg)
-            else:
-                await self._websocket.send_message(msg)
+            await self._websocket.send_message(msg)
+            try:
+                self._websocket.record_candle_transport_event(
+                    "socketio-text", event="chart_notification/get", direction="send",
+                    asset=asset, request_id=f"{sanitize_symbol(asset).replace('_OTC', '_otc')}", status="sent"
+                )
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Failed to request chart notifications: {str(e)}")
             await self._error_monitor.record_error(
@@ -1112,13 +1116,11 @@ class AsyncQuotexClient:
             else:
                 await self._websocket.send_message(upd_msg)
 
-            try:
-                self._websocket.record_candle_transport_event(
-                    "socketio-text", event="chart_notification/get", direction="send",
-                    asset=asset, period=int(timeframe), request_id=request_id, status="sent"
-                )
-            except Exception:
-                pass
+            # Send the chart-notification command on the SAME websocket object
+            # that owns the candle receiver.  In persistent mode the old path
+            # routed this through the keep-alive wrapper, which could make the
+            # transport trace misleading and, on a stale manager, silently
+            # omit the command from the active socket.
             await self.request_chart_notifications(asset)
             if self.enable_logging:
                 logger.warning(f"[CANDLE-DEBUG] SEND chart_notification asset={asset}")
