@@ -571,6 +571,7 @@ class AsyncWebSocketClient:
                     decoded_message = message.decode("utf-8")
                     logger.debug(f"Received binary message: {decoded_message[:100]}...")
                     if decoded_message.startswith('\x04'):
+                        logger.warning(f"[CANDLE-DEBUG] WS binary frame len={len(decoded_message)} pending_event={self._pending_binary_event} prefix={decoded_message[:120]!r}")
                         # Delegate to binary handler that understands pending 451- header
                         await self._handle_candle_message(decoded_message)
                     else:
@@ -621,6 +622,7 @@ class AsyncWebSocketClient:
 
             # JSON header announcing a following binary payload
             if message.startswith("451-["):
+                logger.warning(f"[CANDLE-DEBUG] WS binary header: {message[:300]!r}")
                 await self._handle_json_message_wrapper(message)
                 return
 
@@ -818,10 +820,30 @@ class AsyncWebSocketClient:
                 if isinstance(first, list) and len(first) >= 3 and isinstance(first[0], int) and isinstance(first[1], str) and isinstance(first[2], str):
                     return "assets_list"
                 if isinstance(first, list) and len(first) >= 3 and isinstance(first[0], str) and isinstance(first[1], (int, float)):
+                    # A candle row is normally [timestamp, open, low, high, close, ...].
+                    # Do not classify numeric OHLC rows as quote ticks.
+                    if len(first) >= 5 and all(isinstance(x, (int, float)) for x in first[:5]):
+                        return "candles_received"
                     return "quote_stream"
+                # Some gateways return a bare list of candle rows without asset/period metadata.
+                if isinstance(first, (list, tuple)) and len(first) >= 5:
+                    numeric = all(isinstance(x, (int, float)) for x in first[:5])
+                    if numeric:
+                        return "candles_received"
             if isinstance(payload, dict):
                 if all(k in payload for k in ("asset", "period")) and ("history" in payload or "candles" in payload):
                     return "candles_received"
+                # History may be wrapped under data/history/candles without repeating
+                # the asset/period in the binary payload. The API client will correlate
+                # it only when there is exactly one matching pending request.
+                if any(k in payload for k in ("history", "candles")):
+                    return "candles_received"
+                if isinstance(payload.get("data"), (dict, list)):
+                    nested = payload["data"]
+                    if isinstance(nested, dict) and any(k in nested for k in ("history", "candles")):
+                        return "candles_received"
+                    if isinstance(nested, list) and nested and isinstance(nested[0], (list, tuple)) and len(nested[0]) >= 5:
+                        return "candles_received"
                 if "uid" in payload and "balance" in payload:
                     return "balance_data"
         except Exception:
@@ -919,15 +941,23 @@ class AsyncWebSocketClient:
             if not message.startswith("\x04"):
                 return
             payload = json.loads(message[1:])  # strip ETX
+            if isinstance(payload, dict):
+                logger.warning(f"[CANDLE-DEBUG] WS payload dict keys={list(payload.keys())[:30]}")
+            elif isinstance(payload, list):
+                logger.warning(f"[CANDLE-DEBUG] WS payload list len={len(payload)} first_type={type(payload[0]).__name__ if payload else 'empty'}")
+            else:
+                logger.warning(f"[CANDLE-DEBUG] WS payload type={type(payload).__name__}")
             # If no pending header, infer and dispatch quickly (Pocket Option-like)
             if not self._pending_binary_event:
                 inferred = self._event_headerless_payload(payload)
+                logger.warning(f"[CANDLE-DEBUG] WS headerless inferred_event={inferred}")
                 # Direct emit with no extra allocations/log noise
                 await self._emit_event(inferred, payload)
                 return
             # We have a pending 451 header → route deterministically
             event_name = self._pending_binary_event
             self._pending_binary_event = None
+            logger.warning(f"[CANDLE-DEBUG] WS binary event_name={event_name}")
             if event_name == "s_balance":
                 await self._emit_event("balance_data", payload)
             elif event_name == "s_orders/open":

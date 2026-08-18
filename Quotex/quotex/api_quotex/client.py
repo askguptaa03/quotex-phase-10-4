@@ -1076,6 +1076,8 @@ class AsyncQuotexClient:
         Sends follow/update + chart_notification in one burst. Keeps original behavior & timeouts.
         """
         request_id = f"{asset}_{timeframe}"
+        if self.enable_logging:
+            logger.warning(f"[CANDLE-DEBUG] REQUEST start asset={asset} period={timeframe} count={count}")
         # Reuse an in-flight future for the same rid (like Pocket Option)
         fut = self._candle_requests.get(request_id)
         if fut and not fut.done():
@@ -1088,15 +1090,25 @@ class AsyncQuotexClient:
         try:
             follow_msg = f'42["instruments/follow","{asset}"]'
             upd_msg = f'42["instruments/update",{{"asset":"{asset}","period":{int(timeframe)}}}]'
+            if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] SEND follow asset={asset}")
             if self._is_persistent and self._keep_alive_manager:
                 await self._keep_alive_manager.send_message(follow_msg)
                 await self._keep_alive_manager.send_message(upd_msg)
             else:
                 await self._websocket.send_message(follow_msg)
                 await self._websocket.send_message(upd_msg)
+            if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] SEND update asset={asset} period={timeframe}")
             await self.request_chart_notifications(asset)
+            if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] SEND chart_notification asset={asset}")
             timeout = max(10.0, float(getattr(self._config.trading, "default_timeout", 10)))
+            if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] WAIT response asset={asset} period={timeframe} timeout={timeout}s")
             candles = await asyncio.wait_for(candle_future, timeout=timeout)
+            if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] FUTURE resolved asset={asset} period={timeframe} candles={len(candles) if isinstance(candles, list) else type(candles).__name__}")
             if not candles:
                 # Minimal extension of the same approved error-propagation
                 # mechanism: record that this request resolved successfully
@@ -1110,6 +1122,7 @@ class AsyncQuotexClient:
             return candles[-count:] if isinstance(candles, list) and count else candles
         except asyncio.TimeoutError:
             if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] TIMEOUT asset={asset} period={timeframe}")
                 logger.warning(f"Candle request timed out for {asset} / {timeframe}")
             self._candle_request_errors.setdefault(request_id, {
                 "error": None, "message": "timeout: no response received", "timestamp": time.time(), "kind": "timeout",
@@ -1148,86 +1161,100 @@ class AsyncQuotexClient:
 
     async def _on_candles_received(self, data: Dict[str, Any]) -> None:
         """
-        Handles both history/list/v2 & chart_notification/get payloads.
+        Normalize Quotex candle-history payloads and correlate them safely.
 
-        Correlation rule (Part 3 approved fix): a response is ONLY ever
-        applied to the pending request whose (asset, period) it exactly
-        matches, and is ONLY ever merged into that same (asset, period)
-        FastCandleStore entry. A response that cannot be exactly
-        correlated to a currently-pending request — asset/period missing,
-        or naming an asset/period nothing is currently waiting on (e.g. a
-        late response arriving after its own request already timed out
-        and was removed from _candle_requests) — is NEVER assigned to a
-        different pending request and NEVER written into a different
-        asset's cache. It is recorded via _record_unmatched_candle_
-        response() for diagnostics only. Any other still-pending request
-        is left untouched to resolve via its own normal timeout/retry
-        path in _request_candles(). This intentionally replaces the
-        previous "resolve the first pending future" fallback, which could
-        misassign one asset's candles to a different asset's request.
+        The server may omit asset/period from the binary history payload because
+        those values are already implied by the request. If exactly one candle
+        request is pending, that request is the only safe correlation target.
+        If multiple requests are pending, metadata-less payloads are recorded
+        as unmatched rather than guessed.
         """
         try:
-            # Quotex has emitted candle-history payloads in a few shapes:
-            # {"asset","period","history":[...]},
-            # {"asset","period","candles":[...]}, and, on some routes,
-            # a nested {"data": {...}} wrapper. Normalize those shapes here
-            # without weakening the strict asset/period correlation rule.
+            if self.enable_logging:
+                if isinstance(data, dict):
+                    safe_keys = list(data.keys())[:30]
+                    logger.warning(f"[CANDLE-DEBUG] HANDLER event data_type=dict keys={safe_keys}")
+                elif isinstance(data, list):
+                    logger.warning(f"[CANDLE-DEBUG] HANDLER event data_type=list length={len(data)} first_type={type(data[0]).__name__ if data else 'empty'}")
+                else:
+                    logger.warning(f"[CANDLE-DEBUG] HANDLER event data_type={type(data).__name__}")
             payload: Any = data
-            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+
+            # Unwrap common envelopes.
+            if isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list)):
                 nested = payload.get("data")
-                if any(k in nested for k in ("asset", "period", "history", "candles")):
+                if isinstance(nested, dict) and any(k in nested for k in ("asset", "period", "history", "candles")):
+                    payload = nested
+                elif isinstance(nested, list):
                     payload = nested
 
             asset = payload.get("asset") if isinstance(payload, dict) else None
             period = payload.get("period") if isinstance(payload, dict) else None
+
             candles_raw: List[Any] = []
             if isinstance(payload, dict):
-                if "candles" in payload and isinstance(payload["candles"], list):
+                if isinstance(payload.get("candles"), list):
                     candles_raw = payload["candles"]
-                elif "history" in payload and isinstance(payload["history"], list):
+                elif isinstance(payload.get("history"), list):
                     candles_raw = payload["history"]
-                elif "history" in payload and isinstance(payload["history"], dict):
-                    # Some responses use timestamp keys for history rows.
+                elif isinstance(payload.get("history"), dict):
                     candles_raw = list(payload["history"].values())
+                elif isinstance(payload.get("data"), dict):
+                    nested = payload["data"]
+                    if isinstance(nested.get("candles"), list):
+                        candles_raw = nested["candles"]
+                    elif isinstance(nested.get("history"), list):
+                        candles_raw = nested["history"]
+                    elif isinstance(nested.get("history"), dict):
+                        candles_raw = list(nested["history"].values())
+            elif isinstance(payload, list):
+                candles_raw = payload
 
+            # If metadata is absent, correlate only when exactly one request is pending.
             if asset is None or period is None:
-                # Cannot safely correlate this response to any specific
-                # request — never guess which pending future it belongs
-                # to. Record as unmatched and stop.
-                self._record_unmatched_candle_response(asset, period, reason="missing_asset_or_period")
-                return
+                pending = [
+                    (rid, fut) for rid, fut in self._candle_requests.items()
+                    if fut is not None and not fut.done()
+                ]
+                if len(pending) == 1:
+                    rid, _ = pending[0]
+                    if "_" in rid:
+                        asset, period_text = rid.rsplit("_", 1)
+                        try:
+                            period = int(period_text)
+                        except ValueError:
+                            period = None
+                if asset is None or period is None:
+                    self._record_unmatched_candle_response(asset, period, reason="missing_asset_or_period")
+                    if self.enable_logging:
+                        logger.warning(f"[CANDLE-DEBUG] UNMATCHED missing_asset_or_period pending={list(self._candle_requests.keys())}")
+                    return
 
             period_int = int(period)
-            parsed = self._parse_candles_data(candles_raw, asset, period_int)
-            # Merge into fast store ONLY under the response's own, exactly
-            # stated (asset, period) — never under another asset's key.
+            if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] PARSE asset={asset} period={period_int} raw_count={len(candles_raw)}")
+            parsed = self._parse_candles_data(candles_raw, str(asset), period_int)
+            if self.enable_logging:
+                logger.warning(f"[CANDLE-DEBUG] PARSED asset={asset} period={period_int} candle_count={len(parsed)}")
+
             if parsed:
                 if not hasattr(self, "_fast_store"):
                     self._fast_store = FastCandleStore()
-                self._fast_store.add_many(asset, period_int, parsed)
+                self._fast_store.add_many(str(asset), period_int, parsed)
 
             rid = f"{asset}_{period_int}"
             waiter = self._candle_requests.get(rid)
             if waiter and not waiter.done():
                 waiter.set_result(parsed)
             else:
-                # No pending request is currently waiting on this exact
-                # (asset, period) — e.g. a late response for a request
-                # that already timed out. Do NOT resolve any other
-                # pending future with it; record as unmatched/orphan for
-                # diagnostics and let any other pending request continue
-                # toward its own timeout/retry untouched.
-                self._record_unmatched_candle_response(asset, period_int, reason="no_matching_pending_request")
+                self._record_unmatched_candle_response(
+                    str(asset), period_int, reason="no_matching_pending_request"
+                )
+
         except Exception as e:
             if self.enable_logging:
                 logger.error(f"Error in candles handler: {e}")
-            # Fail-safe: release all waiters to avoid deadlocks. This still
-            # only ever resolves each waiter with an EMPTY result — never
-            # with another asset's data — so no cross-asset contamination
-            # is possible even on this exception path.
-            for _, fut in list(self._candle_requests.items()):
-                if not fut.done():
-                    fut.set_result([])
+            # Do not resolve unrelated requests on a parsing/correlation failure.
         finally:
             await self._emit_event("candles_received", data)
 
