@@ -980,8 +980,11 @@ class AsyncQuotexClient:
         Safe to call multiple times; extremely cheap and improves first-plot latency.
         """
         try:
-            sanitized = sanitize_symbol(asset).replace("_OTC", "_otc")
-            msg = f'42["chart_notification/get",{{"asset":"{sanitized}","version":"{version}"}}]'
+            # Quotex chart notification is a Socket.IO command without a
+            # payload. The asset/timeframe is selected by instruments/update.
+            # Sending a payload here is accepted by some gateways but ignored
+            # by others, which can leave the history response silent.
+            msg = '42["chart_notification/get"]'
             if self._is_persistent and self._keep_alive_manager:
                 await self._keep_alive_manager.send_message(msg)
             else:
@@ -1088,18 +1091,20 @@ class AsyncQuotexClient:
         candle_future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._candle_requests[request_id] = candle_future
         try:
-            follow_msg = f'42["instruments/follow","{asset}"]'
+            # Canonical Quotex chart sequence: select the asset/timeframe,
+            # then request chart notifications. The historical response is
+            # announced by a 451-[...history/list/v2...] header followed by a
+            # binary JSON frame. Avoid the unsupported/legacy
+            # instruments/follow command here; depth/follow is unrelated to
+            # candle history.
             upd_msg = f'42["instruments/update",{{"asset":"{asset}","period":{int(timeframe)}}}]'
             if self.enable_logging:
-                logger.warning(f"[CANDLE-DEBUG] SEND follow asset={asset}")
+                logger.warning(f"[CANDLE-DEBUG] SEND update asset={asset} period={timeframe}")
             if self._is_persistent and self._keep_alive_manager:
-                await self._keep_alive_manager.send_message(follow_msg)
                 await self._keep_alive_manager.send_message(upd_msg)
             else:
-                await self._websocket.send_message(follow_msg)
                 await self._websocket.send_message(upd_msg)
-            if self.enable_logging:
-                logger.warning(f"[CANDLE-DEBUG] SEND update asset={asset} period={timeframe}")
+
             await self.request_chart_notifications(asset)
             if self.enable_logging:
                 logger.warning(f"[CANDLE-DEBUG] SEND chart_notification asset={asset}")
@@ -1159,15 +1164,24 @@ class AsyncQuotexClient:
         """
         return [e for e in self._unmatched_candle_responses if e.get("timestamp", 0) >= since_ts]
 
+
+    def get_candle_transport_diagnostics(self) -> Dict[str, Any]:
+        """Return secret-free WebSocket transport trace for the last diagnostics."""
+        try:
+            return self._websocket.get_candle_transport_diagnostics()
+        except Exception:
+            return {"pending_binary_events": [], "recent_trace": []}
+
     async def _on_candles_received(self, data: Dict[str, Any]) -> None:
         """
         Normalize Quotex candle-history payloads and correlate them safely.
 
-        The server may omit asset/period from the binary history payload because
-        those values are already implied by the request. If exactly one candle
-        request is pending, that request is the only safe correlation target.
-        If multiple requests are pending, metadata-less payloads are recorded
-        as unmatched rather than guessed.
+        Correlation rule (Part 3 approved fix): the server may omit
+        asset/period from the binary history payload because those values are
+        already implied by the request. If exactly one candle request is
+        pending, that request is the only safe correlation target. If multiple
+        requests are pending, metadata-less payloads are recorded as unmatched
+        rather than guessed.
         """
         try:
             if self.enable_logging:
@@ -1260,8 +1274,11 @@ class AsyncQuotexClient:
 
     def _parse_candles_data(self, candles_data: List[Any], asset: str, timeframe: int) -> List["Candle"]:
         """
-        Robust parser for [ts, open, low, high, close, vol?] lists (order seen in DevTools payloads),
-        normalizes high/low and supports optional volume. Keeps original semantics.
+        Robust parser for Quotex history rows. Known gateways have emitted
+        both [ts, open, close, high, low, ticks] and
+        [ts, open, low, high, close, volume] layouts. For list rows, infer
+        the layout from OHLC consistency instead of silently swapping close
+        with low. Dict rows remain field-name based.
         """
         candles: List["Candle"] = []
         try:
@@ -1282,9 +1299,9 @@ class AsyncQuotexClient:
                     elif isinstance(row, (list, tuple)) and len(row) >= 5:
                         ts = row[0]
                         o = row[1]
-                        raw_low = row[2]
-                        raw_high = row[3]
-                        c = row[4]
+                        a = row[2]
+                        b = row[3]
+                        d = row[4]
                         vol = row[5] if len(row) > 5 and row[5] is not None else 0.0
                     else:
                         continue
@@ -1294,12 +1311,42 @@ class AsyncQuotexClient:
                         if ts > 2_000_000_000:
                             ts /= 1000.0
                         o = float(o)
-                        raw_low = float(raw_low)
-                        raw_high = float(raw_high)
-                        c = float(c)
+                        if isinstance(row, (list, tuple)):
+                            a = float(a)
+                            b = float(b)
+                            d = float(d)
+
+                            # Candidate 1: [open, low, high, close]
+                            c1 = d
+                            lo1, hi1 = min(a, b), max(a, b)
+                            valid1 = lo1 <= min(o, c1) <= max(o, c1) <= hi1
+
+                            # Candidate 2: [open, close, high, low]
+                            c2 = a
+                            lo2, hi2 = min(b, d), max(b, d)
+                            valid2 = lo2 <= min(o, c2) <= max(o, c2) <= hi2
+
+                            if valid2 and not valid1:
+                                c, lo, hi = c2, lo2, hi2
+                            elif valid1 and not valid2:
+                                c, lo, hi = c1, lo1, hi1
+                            elif valid2 and valid1:
+                                # Ambiguous but both geometries are valid;
+                                # prefer the current Quotex history layout
+                                # [open, close, high, low].
+                                c, lo, hi = c2, lo2, hi2
+                            else:
+                                # Malformed OHLC row; do not fabricate data.
+                                continue
+                        else:
+                            o = float(o)
+                            raw_low = float(raw_low)
+                            raw_high = float(raw_high)
+                            c = float(c)
+                            hi = max(raw_high, raw_low)
+                            lo = min(raw_high, raw_low)
+
                         vol = float(vol) if vol is not None else 0.0
-                        hi = max(raw_high, raw_low)
-                        lo = min(raw_high, raw_low)
                         candle = Candle(
                             timestamp=datetime.fromtimestamp(ts),
                             open=o, high=hi, low=lo, close=c, volume=vol,
