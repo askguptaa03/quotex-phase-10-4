@@ -109,6 +109,33 @@ class QuotexDataFetcher:
         # contains the SSID or any secret value — only status labels.
         self.last_fetch_diagnostics: dict = {}
 
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+
+    def get_candle_transport_diagnostics(self) -> dict:
+        """Return secret-free WebSocket transport diagnostics from the client."""
+        try:
+            if self._client is None:
+                return {"pending_binary_events": [], "recent_trace": [], "trace_count": 0, "last_event": None}
+            return dict(self._client.get_candle_transport_diagnostics() or {})
+        except Exception:
+            return {"pending_binary_events": [], "recent_trace": [], "trace_count": 0, "last_event": None}
+
+    def get_recent_unmatched_candle_responses(self, since_ts: float = 0.0) -> list:
+        try:
+            if self._client is None:
+                return []
+            return list(self._client.get_recent_unmatched_candle_responses(since_ts))
+        except Exception:
+            return []
+
+    def get_recent_uncorrelated_candle_errors(self, since_ts: float = 0.0) -> list:
+        try:
+            if self._client is None:
+                return []
+            return list(self._client.get_recent_uncorrelated_candle_errors(since_ts))
+        except Exception:
+            return []
+
     # ── Connection ───────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
