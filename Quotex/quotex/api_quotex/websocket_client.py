@@ -818,8 +818,23 @@ class AsyncWebSocketClient:
                 return
 
             if event in ("error",):
+                self._candle_transport_trace.append({
+                    "ts": time.time(), "direction": "recv", "frame": "socketio-text",
+                    "event": event, "payload_type": type(body).__name__,
+                    "payload_count": len(body) if isinstance(body, (list, dict)) else None,
+                })
                 await self._emit_event("error", body)
                 return
+
+            # Keep a transport-level record for chart/market events even when
+            # they are not candle payloads. This makes the diagnostic useful
+            # when Quotex changes event names.
+            if isinstance(event, str) and ("chart" in event or "history" in event or "candle" in event):
+                self._candle_transport_trace.append({
+                    "ts": time.time(), "direction": "recv", "frame": "socketio-text",
+                    "event": event, "payload_type": type(body).__name__,
+                    "payload_count": len(body) if isinstance(body, (list, dict)) else None,
+                })
 
             # Fallback: forward raw
             await self._emit_event("json_data", {"event": event, "data": body})
