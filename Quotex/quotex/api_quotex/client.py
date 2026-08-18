@@ -985,7 +985,11 @@ class AsyncQuotexClient:
         """
         msg = '42["chart_notification/get"]'
         try:
-            await self._websocket.send_message(msg)
+            # This is part of the candle request/response transaction. It must
+            # reach the active socket immediately; queueing it can leave the
+            # candle future waiting while the diagnostic incorrectly reports
+            # only the earlier instruments/update frame.
+            await self._websocket.send_message_immediate(msg)
             try:
                 self._websocket.record_candle_transport_event(
                     "socketio-text", event="chart_notification/get", direction="send",
@@ -997,11 +1001,13 @@ class AsyncQuotexClient:
             logger.error(f"Failed to request chart notifications: {str(e)}")
             await self._error_monitor.record_error(
                 error_type="chart_notification_request_failed",
-                severity=ErrorSeverity.MEDIUM,
+                severity=ErrorSeverity.HIGH,
                 category=ErrorCategory.DATA,
                 message=f"Failed to request chart notifications: {str(e)}",
                 context={"asset": asset, "version": version}
             )
+            # Do not hide a transport failure behind the generic candle timeout.
+            raise
 
     async def get_candles(self, asset: str, timeframe: Union[str, int], count: int = 100,
                           end_time: Optional[datetime] = None) -> List["Candle"]:
@@ -1104,6 +1110,9 @@ class AsyncQuotexClient:
             upd_msg = f'42["instruments/update",{{"asset":"{asset}","period":{int(timeframe)}}}]'
             if self.enable_logging:
                 logger.warning(f"[CANDLE-DEBUG] SEND update asset={asset} period={timeframe}")
+            # Candle history must use a confirmed, immediate frame send.
+            # Do not route this request through the batching/keep-alive queue.
+            await self._websocket.send_message_immediate(upd_msg)
             try:
                 self._websocket.record_candle_transport_event(
                     "socketio-text", event="instruments/update", direction="send",
@@ -1111,10 +1120,6 @@ class AsyncQuotexClient:
                 )
             except Exception:
                 pass
-            if self._is_persistent and self._keep_alive_manager:
-                await self._keep_alive_manager.send_message(upd_msg)
-            else:
-                await self._websocket.send_message(upd_msg)
 
             # Send the chart-notification command on the SAME websocket object
             # that owns the candle receiver.  In persistent mode the old path

@@ -335,6 +335,40 @@ class AsyncWebSocketClient:
         payload = json.dumps([event, data], separators=(",", ":"))
         await self.send_message("42" + payload)
 
+    async def send_message_immediate(self, message: str) -> None:
+        """
+        Send one Socket.IO frame immediately on the active WebSocket.
+
+        Candle-history requests use this path because the normal send_message()
+        method intentionally queues small bursts for delayed batching. A queued
+        message is not proof that the frame reached the socket, which made the
+        candle diagnostic misleading and could delay the request/response pair.
+        """
+        if not self.websocket or self.websocket.closed:
+            self.websocket_is_connected = False
+            raise WebSocketError("WebSocket is not connected")
+
+        while self.ssl_mutual_exclusion or self.ssl_mutual_exclusion_write:
+            await asyncio.sleep(0.01)
+
+        self.ssl_mutual_exclusion_write = True
+        try:
+            await self.websocket.send(message)
+            logger.debug(f"Sent immediate message: {message}")
+        except Exception as e:
+            self.websocket_is_connected = False
+            logger.error(f"Failed to send immediate message: {str(e)}")
+            await error_monitor.record_error(
+                error_type="websocket_immediate_send_failed",
+                severity=ErrorSeverity.MEDIUM,
+                category=ErrorCategory.CONNECTION,
+                message=f"Failed to send immediate message: {str(e)}",
+                context={"message": message[:100]},
+            )
+            raise WebSocketError(f"Failed to send immediate message: {str(e)}")
+        finally:
+            self.ssl_mutual_exclusion_write = False
+
     async def send_message_optimized(self, message: str) -> None:
         """Compatibility: rate-limited wrapper that delegates to the batched send_message."""
         async with self._rate_limiter:
